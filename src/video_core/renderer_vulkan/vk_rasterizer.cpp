@@ -52,6 +52,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/raster_split.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -649,6 +650,10 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    // EDEN_NX2_RASTER_SPLIT=2: the raster thread decides conditional rendering on its twin.
+    if (VideoCommon::RasterSplit::OnRasterThread() && !maxwell3d->ShouldExecute()) {
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -842,6 +847,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    // EDEN_NX2_RASTER_SPLIT=2: the raster thread decides conditional rendering on its twin.
+    if (VideoCommon::RasterSplit::OnRasterThread() && !maxwell3d->ShouldExecute()) {
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
@@ -1084,6 +1093,10 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    // EDEN_NX2_RASTER_SPLIT=2: the raster thread decides conditional rendering on its twin.
+    if (VideoCommon::RasterSplit::OnRasterThread() && !maxwell3d->ShouldExecute()) {
+        return;
+    }
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1134,6 +1147,10 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    // EDEN_NX2_RASTER_SPLIT=2: the raster thread decides conditional rendering on its twin.
+    if (VideoCommon::RasterSplit::OnRasterThread() && !maxwell3d->ShouldExecute()) {
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;

@@ -3306,6 +3306,7 @@ public:
 
 private:
     void SyncRasterTwinImpl();
+    static bool RasterDecidesConditions();
     Maxwell3D* raster_twin{};
 
     void ConsumeSinkImpl(Core::System& system) override;

@@ -362,6 +362,14 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     }
 }
 
+bool Maxwell3D::RasterDecidesConditions() {
+    static const bool on_raster = [] {
+        const char* value = std::getenv("EDEN_NX2_RASTER_COND");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on_raster;
+}
+
 void Maxwell3D::SyncRasterTwinImpl() {
     if (auto& raster = VideoCommon::RasterSplit::Get(); raster.OnProducer()) {
         // The raster thread applies the copy in order, before the work that reads it.
@@ -376,12 +384,13 @@ void Maxwell3D::SyncRasterTwinImpl() {
             State state;
             RootTables root_tables;
             bool execute_on;
+            bool cond_on_raster;
             decltype(dirty.flags) flags;
         };
         auto snapshot = std::make_unique<Snapshot>(Snapshot{
             raster_twin, regs.const_buffer, regs.load_mme, regs.shadow_scratch[0],
             draw_manager.draw_state, draw_manager.draw_texture_state, draw_manager.indirect_state,
-            state, root_tables, execute_on, dirty.flags});
+            state, root_tables, execute_on, RasterDecidesConditions(), dirty.flags});
         dirty.flags.reset();
         raster.Defer([s = std::move(snapshot)] {
             Maxwell3D& twin = *s->twin;
@@ -393,7 +402,9 @@ void Maxwell3D::SyncRasterTwinImpl() {
             twin.draw_manager.indirect_state = s->indirect_state;
             twin.state = s->state;
             twin.root_tables = s->root_tables;
-            twin.execute_on = s->execute_on;
+            if (!s->cond_on_raster) {
+                twin.execute_on = s->execute_on;
+            }
             twin.dirty.flags |= s->flags;
         });
         return;
@@ -750,6 +761,19 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    // EDEN_NX2_RASTER_COND=0 (bisecting): decide on the back, as before the raster stage.
+    static const bool on_raster = [] {
+        const char* value = std::getenv("EDEN_NX2_RASTER_COND");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (auto& raster = VideoCommon::RasterSplit::Get();
+        on_raster && raster_twin != nullptr && raster.OnProducer()) {
+        // The raster thread decides on its twin (the results are its state), and its draws check
+        // it; here every draw goes through.
+        raster.Defer([twin = raster_twin] { twin->ProcessQueryCondition(); });
+        execute_on = true;
+        return;
+    }
     SyncRasterTwin();
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;

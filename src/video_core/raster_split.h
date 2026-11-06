@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstddef>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -41,12 +43,12 @@ public:
         return active.load(std::memory_order_acquire);
     }
     /// EDEN_NX2_RASTER_ASYNC=<bitmask>: which calls are queued (1 draws, 2 queries and fences,
-    /// 4 uniform binds, 8 constant buffer data, 16 inline uploads, 32 the rest); default all but
-    /// inline uploads, which something still reads before the raster thread writes them.
+    /// 4 uniform binds, 8 constant buffer data, 16 inline uploads, 32 the rest); default 15:
+    /// with 16 something still reads inline uploads too early, and 16 or 32 hang Ocarina of Time.
     [[nodiscard]] static u32 AsyncGroups() {
         static const u32 groups = [] {
             const char* value = std::getenv("EDEN_NX2_RASTER_ASYNC");
-            return value == nullptr ? 0xefu : static_cast<u32>(std::strtoul(value, nullptr, 0));
+            return value == nullptr ? 0x0fu : static_cast<u32>(std::strtoul(value, nullptr, 0));
         }();
         return groups;
     }
@@ -59,23 +61,39 @@ public:
     void Start(Core::System& system);
     void Stop();
 
-    /// Runs `func` on the raster thread after everything sent before it. Producer only.
+    /// Runs `func` on the raster thread after everything sent before it. Producer only. Small
+    /// functions are built in the ring itself (no allocation).
     template <typename Func>
     void Defer(Func&& func) {
         using F = std::decay_t<Func>;
         FlushDeltas();
-        auto* const holder = new F(std::forward<Func>(func));
-        Push({[](void* argument) {
-                  auto* const f = static_cast<F*>(argument);
-                  (*f)();
-                  delete f;
-              },
-              holder});
+        Task& task = Reserve();
+        if constexpr (sizeof(F) <= TaskStorage && alignof(F) <= alignof(std::max_align_t)) {
+            new (task.storage) F(std::forward<Func>(func));
+            task.run = [](Task& self) {
+                F* const f = std::launder(reinterpret_cast<F*>(self.storage));
+                (*f)();
+                f->~F();
+            };
+        } else {
+            auto* const holder = new F(std::forward<Func>(func));
+            new (task.storage) F*(holder);
+            task.run = [](Task& self) {
+                F* const f = *std::launder(reinterpret_cast<F**>(self.storage));
+                (*f)();
+                delete f;
+            };
+        }
+        Commit();
     }
 
     /// A register change for a twin engine, sent with the next piece of work.
     void QueueDelta(Tegra::Engines::Maxwell3D* twin, u32 method, u32 value) {
-        deltas.push_back({twin, method, value});
+        if (delta_head - delta_flushed_tail >= DeltaRingSize) [[unlikely]] {
+            WaitDeltaRoom();
+        }
+        delta_ring[delta_head % DeltaRingSize] = {twin, method, value};
+        ++delta_head;
     }
 
     /// Producer: waits until the raster thread ran everything sent so far.
@@ -102,9 +120,10 @@ public:
     static inline thread_local u32 inline_depth{};
 
 private:
+    static constexpr size_t TaskStorage = 112;
     struct Task {
-        void (*run)(void*);
-        void* argument;
+        void (*run)(Task& self);
+        alignas(std::max_align_t) unsigned char storage[TaskStorage];
     };
     struct Delta {
         Tegra::Engines::Maxwell3D* twin;
@@ -112,9 +131,13 @@ private:
         u32 value;
     };
     static constexpr u64 RingSize = u64{1} << 16;
+    static constexpr u64 DeltaRingSize = u64{1} << 20;
 
-    void Push(Task task);
+    /// The slot for the next task (waits for room); Commit makes it visible.
+    Task& Reserve();
+    void Commit();
     void FlushDeltas();
+    void WaitDeltaRoom();
     void Loop(std::stop_token stop_token);
 
     static RasterSplit instance;
@@ -123,13 +146,17 @@ private:
     Core::System* system{};
     std::atomic<bool> active{};
     std::unique_ptr<Task[]> ring;
+    std::unique_ptr<Delta[]> delta_ring;
+    u64 delta_head{};                       ///< Producer: next delta slot
+    u64 delta_flushed{};                    ///< Producer: deltas already sent in a task
+    u64 delta_flushed_tail{};               ///< Producer: oldest delta not known applied
+    std::atomic<u64> delta_applied{};       ///< Raster: deltas applied
     std::atomic<u64> sent{};
     std::atomic<u64> done{};
     std::atomic<u32> wake{};
     std::atomic<bool> sleeping{};
     std::atomic<bool> hook_requested{};
     std::mutex owner;
-    std::vector<Delta> deltas;
     std::thread::id producer{};
     void (*idle_hook)(void*){};
     void* idle_argument{};

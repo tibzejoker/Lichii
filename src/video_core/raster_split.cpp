@@ -46,6 +46,9 @@ void RasterSplit::Start(Core::System& system_) {
     }
     system = &system_;
     ring = std::make_unique<Task[]>(RingSize);
+    delta_ring = std::make_unique<Delta[]>(DeltaRingSize);
+    delta_head = delta_flushed = delta_flushed_tail = 0;
+    delta_applied.store(0, std::memory_order_relaxed);
     sent.store(0, std::memory_order_relaxed);
     done.store(0, std::memory_order_relaxed);
     producer = std::this_thread::get_id();
@@ -66,7 +69,7 @@ void RasterSplit::Stop() {
     thread = {};
 }
 
-void RasterSplit::Push(Task task) {
+RasterSplit::Task& RasterSplit::Reserve() {
     const u64 position = sent.load(std::memory_order_relaxed);
     for (u32 spins = 0; position - done.load(std::memory_order_acquire) >= RingSize; ++spins) {
         if (spins < 4096) {
@@ -75,29 +78,55 @@ void RasterSplit::Push(Task task) {
             std::this_thread::yield();
         }
     }
-    ring[position % RingSize] = task;
-    sent.store(position + 1, std::memory_order_seq_cst);
+    return ring[position % RingSize];
+}
+
+void RasterSplit::Commit() {
+    sent.store(sent.load(std::memory_order_relaxed) + 1, std::memory_order_seq_cst);
     if (sleeping.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
 }
 
+void RasterSplit::WaitDeltaRoom() {
+    FlushDeltas();
+    for (u32 spins = 0;; ++spins) {
+        delta_flushed_tail = delta_applied.load(std::memory_order_acquire);
+        if (delta_head - delta_flushed_tail < DeltaRingSize) {
+            return;
+        }
+        if (spins < 4096) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
 void RasterSplit::FlushDeltas() {
-    if (deltas.empty()) {
+    if (delta_flushed == delta_head) {
         return;
     }
-    auto* const batch = new std::vector<Delta>(std::move(deltas));
-    deltas = {};
-    deltas.reserve(batch->size());
-    Push({[](void* argument) {
-              auto* const list = static_cast<std::vector<Delta>*>(argument);
-              for (const Delta& delta : *list) {
-                  delta.twin->ApplyRasterDelta(delta.method, delta.value);
-              }
-              delete list;
-          },
-          batch});
+    const u64 begin = delta_flushed;
+    const u64 end = delta_head;
+    delta_flushed = end;
+    Task& task = Reserve();
+    struct Range {
+        RasterSplit* split;
+        u64 begin;
+        u64 end;
+    };
+    new (task.storage) Range{this, begin, end};
+    task.run = [](Task& self) {
+        const Range range = *std::launder(reinterpret_cast<Range*>(self.storage));
+        for (u64 i = range.begin; i != range.end; ++i) {
+            const Delta& delta = range.split->delta_ring[i % DeltaRingSize];
+            delta.twin->ApplyRasterDelta(delta.method, delta.value);
+        }
+        range.split->delta_applied.store(range.end, std::memory_order_release);
+    };
+    Commit();
 }
 
 void RasterSplit::Drain() {
@@ -166,8 +195,8 @@ void RasterSplit::Loop(std::stop_token stop_token) {
         }
         std::scoped_lock lock{owner};
         while (position != available) {
-            const Task task = ring[position % RingSize];
-            task.run(task.argument);
+            Task& task = ring[position % RingSize];
+            task.run(task);
             ++position;
             done.store(position, std::memory_order_release);
         }
