@@ -96,6 +96,22 @@ public:
         ++delta_head;
     }
 
+    /// Producer: the back has executed its ring up to `position`; once the raster thread runs
+    /// what was sent before this, BackDone() reaches it.
+    void MarkBackPosition(u64 position) {
+        if (position == marked) {
+            return;
+        }
+        marked = position;
+        Defer([this, position] { back_done.store(position, std::memory_order_release); });
+    }
+    /// The back ring position whose raster work is all done.
+    [[nodiscard]] u64 BackDone() const {
+        return back_done.load(std::memory_order_acquire);
+    }
+    /// Any thread: waits until the raster thread ran the work the back sent up to `position`.
+    void WaitBackDone(u64 position);
+
     /// Producer: waits until the raster thread ran everything sent so far.
     void Drain();
     /// Any thread: waits until the raster thread ran the work sent before this call.
@@ -151,6 +167,8 @@ private:
     u64 delta_flushed{};                    ///< Producer: deltas already sent in a task
     u64 delta_flushed_tail{};               ///< Producer: oldest delta not known applied
     std::atomic<u64> delta_applied{};       ///< Raster: deltas applied
+    std::atomic<u64> back_done{};           ///< Raster: back ring position fully done
+    u64 marked{};                           ///< Producer: last marked back position
     std::atomic<u64> sent{};
     std::atomic<u64> done{};
     std::atomic<u32> wake{};

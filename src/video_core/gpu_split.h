@@ -211,10 +211,13 @@ public:
             words -= count;
         }
     }
-    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
+    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory. With
+    /// the raster stage, the position both stages have run.
     [[nodiscard]] u64 ConsumedNow() {
-        return consumed.load(std::memory_order_acquire);
+        return DonePosition(consumed.load(std::memory_order_acquire));
     }
+    /// `consumed`, held back to what the raster stage has also run.
+    [[nodiscard]] static u64 DonePosition(u64 back_consumed);
     /// Applies to `out` (the words at device address `begin`, read from guest memory after
     /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
     /// overlapping queued write's words are unknown (the caller waits instead).

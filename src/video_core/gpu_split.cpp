@@ -202,7 +202,7 @@ void GpuSplit::Publish() {
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
-        RasterSplit::Get().WaitSent();
+        RasterSplit::Get().WaitBackDone(write_position);
         return;
     }
     Publish();
@@ -212,7 +212,7 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
-            RasterSplit::Get().WaitSent();
+            RasterSplit::Get().WaitBackDone(write_position);
             Nx2Profile::AddDrain(site, start);
             return;
         }
@@ -235,6 +235,7 @@ bool GpuSplit::WaitForMemoryWriters() {
 
 bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
     consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 done_position = DonePosition(consumed_cache);
     const u64 end = begin + size;
     const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
     u64 target = 0;
@@ -242,7 +243,7 @@ bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
     for (; scanned < remembered; ++scanned) {
         const PendingWrite& write =
             pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
-        if (write.position <= consumed_cache) {
+        if (write.position <= done_position) {
             break;
         }
         if (write.begin < end && begin < write.end) {
@@ -260,12 +261,13 @@ bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
 
 bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
     consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 done_position = DonePosition(consumed_cache);
     const u64 end = begin + size;
     const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
     for (u64 scanned = 0; scanned < remembered; ++scanned) {
         const PendingWrite& write =
             pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
-        if (write.position <= consumed_cache) {
+        if (write.position <= done_position) {
             return false;
         }
         if (write.begin < end && begin < write.end) {
@@ -326,6 +328,11 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
     return true;
 }
 
+u64 GpuSplit::DonePosition(u64 back_consumed) {
+    auto& raster = RasterSplit::Get();
+    return raster.Active() ? (std::min)(back_consumed, raster.BackDone()) : back_consumed;
+}
+
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
@@ -334,7 +341,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         // What the back sent to the raster thread for that work (inline uploads) too.
-        RasterSplit::Get().WaitSent();
+        RasterSplit::Get().WaitBackDone(target);
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
@@ -345,7 +352,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
-            RasterSplit::Get().WaitSent();
+            RasterSplit::Get().WaitBackDone(target);
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -520,9 +527,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                if (RasterSplit::Get().Active()) {
+                    RasterSplit::Get().MarkBackPosition(read_position);
+                }
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }
+        }
+        if (RasterSplit::Get().Active()) {
+            RasterSplit::Get().MarkBackPosition(read_position);
         }
         consumed.store(read_position, std::memory_order_release);
     }

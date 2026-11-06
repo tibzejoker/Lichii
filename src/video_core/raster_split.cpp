@@ -49,6 +49,8 @@ void RasterSplit::Start(Core::System& system_) {
     delta_ring = std::make_unique<Delta[]>(DeltaRingSize);
     delta_head = delta_flushed = delta_flushed_tail = 0;
     delta_applied.store(0, std::memory_order_relaxed);
+    back_done.store(0, std::memory_order_relaxed);
+    marked = 0;
     sent.store(0, std::memory_order_relaxed);
     done.store(0, std::memory_order_relaxed);
     producer = std::this_thread::get_id();
@@ -137,6 +139,19 @@ void RasterSplit::Drain() {
         FlushDeltas();
     }
     WaitSent();
+}
+
+void RasterSplit::WaitBackDone(u64 position) {
+    if (!Active() || on_raster_thread) {
+        return;
+    }
+    for (u32 spins = 0; back_done.load(std::memory_order_acquire) < position; ++spins) {
+        if (spins < 16384) {
+            Pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
 }
 
 void RasterSplit::WaitSent() {
