@@ -92,6 +92,7 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
 }
 
 void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
+    maxwell3d.SyncRasterTwin();
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Clear(layer_count);
     }
@@ -309,6 +310,7 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_y1 = (f32(maxwell3d.regs.draw_texture.dy_dv) / 4294967296.f) * dst_height + draw_texture_state.src_y0;
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
+    maxwell3d.SyncRasterTwin();
     maxwell3d.rasterizer->DrawTexture();
 }
 
@@ -343,6 +345,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        maxwell3d.SyncRasterTwin();
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {
         TraceSuppressedDraw(maxwell3d, false);
@@ -354,6 +357,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
+        maxwell3d.SyncRasterTwin();
         maxwell3d.rasterizer->DrawIndirect();
     } else {
         TraceSuppressedDraw(maxwell3d, true);

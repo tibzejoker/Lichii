@@ -3280,6 +3280,33 @@ private:
 
     void ProcessDirtyRegisters(u32 method, u32 argument);
 
+public:
+    /// EXPERIMENT (not for nx2): EDEN_NX2_RASTER_SPLIT. The rasterizer reads a twin of this
+    /// engine: register changes reach it as deltas, the draw state as a copy at each draw.
+    void SetRasterTwin(Maxwell3D* twin) {
+        raster_twin = twin;
+    }
+    [[nodiscard]] Maxwell3D* RasterTwin() const {
+        return raster_twin;
+    }
+    /// Brings the twin up to date before the rasterizer reads it (draws, clears, queries).
+    void SyncRasterTwin() {
+        if (raster_twin != nullptr) {
+            SyncRasterTwinImpl();
+        }
+    }
+
+private:
+    void SyncRasterTwinImpl();
+    /// A register change on the twin: the value and the dirty flags its tables map it to.
+    void ApplyRasterDelta(u32 method, u32 argument) {
+        regs.reg_array[method] = argument;
+        for (auto const& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
+    Maxwell3D* raster_twin{};
+
     void ConsumeSinkImpl(Core::System& system) override;
 
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);

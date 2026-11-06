@@ -352,6 +352,54 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
+    if (raster_twin != nullptr) {
+        raster_twin->ApplyRasterDelta(method, argument);
+    }
+}
+
+void Maxwell3D::SyncRasterTwinImpl() {
+    Maxwell3D& twin = *raster_twin;
+    // Registers written outside ProcessDirtyRegisters.
+    twin.regs.const_buffer = regs.const_buffer;
+    twin.regs.load_mme = regs.load_mme;
+    twin.regs.shadow_scratch[0] = regs.shadow_scratch[0];
+    // Snapshots of what is not register state.
+    twin.draw_manager.draw_state = draw_manager.draw_state;
+    twin.draw_manager.draw_texture_state = draw_manager.draw_texture_state;
+    twin.draw_manager.indirect_state = draw_manager.indirect_state;
+    twin.state = state;
+    twin.root_tables = root_tables;
+    twin.execute_on = execute_on;
+    // Flags the engine sets itself (the index buffer, shaders): this engine's tables are not set
+    // up while a twin exists, so its flags hold only those.
+    twin.dirty.flags |= dirty.flags;
+    dirty.flags.reset();
+    // EDEN_NX2_RASTER_VERIFY=1: compare the twin's registers with this engine's at each sync.
+    static const bool verify = std::getenv("EDEN_NX2_RASTER_VERIFY") != nullptr;
+    if (verify) [[unlikely]] {
+        static u64 checks{};
+        static u64 differences{};
+        ++checks;
+        u32 logged = 0;
+        for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+            if (twin.regs.reg_array[i] != regs.reg_array[i]) {
+                if (differences < 64 && logged < 8) {
+                    LOG_WARNING(HW_GPU, "Raster twin register {:#x}: twin {:#x}, engine {:#x}", i,
+                                twin.regs.reg_array[i], regs.reg_array[i]);
+                    ++logged;
+                }
+                ++differences;
+            }
+        }
+        if (logged != 0) {
+            twin.regs = regs;
+            twin.dirty.flags.set();
+        }
+        if ((checks & 0xffff) == 0) {
+            LOG_INFO(HW_GPU, "Raster twin checks: {} done, {} register differences", checks,
+                     differences);
+        }
+    }
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -627,6 +675,7 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
 }
 
 void Maxwell3D::ProcessQueryGet() {
+    SyncRasterTwin();
     VideoCommon::QueryPropertiesFlags flags{};
     if (regs.report_semaphore.query.short_query == 0) {
         flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
@@ -661,6 +710,7 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    SyncRasterTwin();
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;

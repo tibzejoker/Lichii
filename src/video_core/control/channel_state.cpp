@@ -73,6 +73,11 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
     program_id = program_id_;
     payload.emplace(system, *memory_manager, *this);
     BindNvkDefaultSubchannels(*payload);
+    if (const char* split = std::getenv("EDEN_NX2_RASTER_SPLIT"); split && split[0] != '0') {
+        payload->raster_3d = std::make_unique<Engines::Maxwell3D>(*memory_manager);
+        payload->raster_3d->regs = payload->maxwell_3d.regs;
+        payload->maxwell_3d.SetRasterTwin(payload->raster_3d.get());
+    }
     if (g_nx2_ampere) {
         // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
         // block-linear surfaces the console's GOB swizzle.
@@ -80,6 +85,10 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
         const auto macros = Nx2MacroContext();
         payload->maxwell_3d.SetNativeMacroContext(macros);
         payload->maxwell_3d.SetNativeTuringMacroMode(true);
+        if (payload->raster_3d) {
+            payload->raster_3d->SetNativeMacroContext(macros);
+            payload->raster_3d->SetNativeTuringMacroMode(true);
+        }
         payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
                                                    macros.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
@@ -91,6 +100,9 @@ void ChannelState::BindRasterizer(VideoCore::RasterizerInterface* rasterizer) {
     payload->dma_pusher.BindRasterizer(rasterizer);
     memory_manager->BindRasterizer(rasterizer);
     payload->maxwell_3d.BindRasterizer(rasterizer);
+    if (payload->raster_3d) {
+        payload->raster_3d->BindRasterizer(rasterizer);
+    }
     payload->fermi_2d.BindRasterizer(rasterizer);
     payload->kepler_memory.BindRasterizer(rasterizer);
     payload->kepler_compute.BindRasterizer(rasterizer);

@@ -55,6 +55,13 @@ struct ChannelState {
         /// NV01 Timer
         Engines::Nv01Timer nv01_timer;
         DmaPusher dma_pusher;
+        /// EXPERIMENT (not for nx2): EDEN_NX2_RASTER_SPLIT, the 3D engine the rasterizer reads.
+        std::unique_ptr<Engines::Maxwell3D> raster_3d;
+
+        /// The 3D engine whose state the rasterizer reads.
+        Engines::Maxwell3D& Raster3D() {
+            return raster_3d ? *raster_3d : maxwell_3d;
+        }
     };
     std::optional<Payload> payload;
     MemoryManager* memory_manager = nullptr;
