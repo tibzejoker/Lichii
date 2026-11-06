@@ -222,7 +222,17 @@ void GpuSplit::Drain(DrainSite site) {
 }
 
 bool GpuSplit::WaitForWriters() {
-    return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+    // A GPU-written command list is only fetched in order after a host-level wait (WFI, a
+    // syncpoint or semaphore acquire, a GP entry's sync bit): the front fetches ahead as the
+    // hardware does, so only the writers sent before the last such wait can have written it.
+    // TEMP EDEN_NX2_LIST_SYNC=0: wait for every queued writer, as before.
+    static const bool sync_only = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_SYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    const u64 writers = std::min(last_writer_position, write_position);
+    return WaitFor(sync_only ? std::min(writers, last_sync_position) : writers,
+                   DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {

@@ -1206,6 +1206,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (WritesGuestMemory(method)) {
         FrontNoteMemoryWrite(split, fs, method, &value, 1);
     }
+    if (method == MAXWELL3D_REG_INDEX(wait_for_idle)) {
+        split.NoteSync(); // A host-level wait too (GpuSplit::WaitForWriters)
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

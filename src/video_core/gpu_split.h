@@ -165,6 +165,12 @@ public:
     void NoteWriter() {
         last_writer_position = write_position;
     }
+    /// Whether compute or copy work sent after the last host-level wait may still be queued
+    /// (what WaitForWriters no longer waits for).
+    [[nodiscard]] bool WritersAfterLastSync() {
+        return last_writer_position > last_sync_position &&
+               last_writer_position > consumed.load(std::memory_order_acquire);
+    }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();

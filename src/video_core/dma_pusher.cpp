@@ -198,10 +198,35 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+            auto& split = VideoCommon::GpuSplit::Get();
+            // EDEN_NX2_LIST_CHECK=1: for entries fetched while writers sent after the last host
+            // wait are queued, the back compares the words once it ran them and logs changes.
+            static const bool list_check = std::getenv("EDEN_NX2_LIST_CHECK") != nullptr;
+            if (list_check && split.WritersAfterLastSync()) [[unlikely]] {
+                const GPUVAddr address = dma_state.dma_get;
+                std::vector<u32> words(header.size);
+                memory_manager.ReadBlockUnsafe(address, words.data(), words.size() * sizeof(u32));
+                split.DeferFunction([memory = &memory_manager, address, words = std::move(words)] {
+                    static std::atomic<u64> checks{};
+                    static std::atomic<u64> misses{};
+                    std::vector<u32> now(words.size());
+                    memory->ReadBlockUnsafe(address, now.data(), now.size() * sizeof(u32));
+                    const u64 count = checks.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (now != words && misses.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_WARNING(HW_GPU, "List check: entry at {:#x} ({} words) changed after "
+                                            "it was fetched", address, words.size());
+                    }
+                    if ((count & 0x3fff) == 0) {
+                        LOG_INFO(HW_GPU, "List check: {} entries, {} changed", count,
+                                 misses.load(std::memory_order_relaxed));
+                    }
+                });
+            }
+            if (split.WaitForWriters()) {
+                gpu_written =
+                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            }
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
