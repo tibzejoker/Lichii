@@ -1121,39 +1121,77 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
-    u64 verify_seq{};                         ///< Predictions to verify after the next send
-    std::unordered_set<u64> dependency_qmds;  ///< QMDs with dependency counts: not predicted
+    u64 verify_seq{}; ///< Predictions to verify after the next send
 };
 
-void KeplerCompute::FrontPredictQmd(FrontState& fs, u64 qmd_address, const u32* qmd) {
-    if (fs.dependency_qmds.contains(qmd_address)) {
-        return;
+namespace {
+/// EXPERIMENT (not for nx2): EDEN_NX2_QMD_PREDICT=1. The split front's copy of the back's QMD
+/// scheduler: it gets the same signals, in the same order, with the QMDs as the back will read
+/// them, so the QMDs it runs are those the back will run. Shared by every channel, as the
+/// back's table is.
+struct FrontQmdShadow {
+    FrontQmdShadow() {
+        scheduler.UseOwnTable();
     }
-    // As NativeQmdScheduler::Signal: a QMD 3.0 without dependencies runs at once.
-    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100) || ((qmd[4] >> 14) & 0xffff) != 0) {
-        return;
-    }
-    constexpr std::array<u32, 3> slots{24, 28, 52};
-    for (const u32 base : slots) {
-        const u32 flags = qmd[base + 1];
-        if (!(flags & (1U << 23))) {
-            continue;
-        }
-        const bool add = (flags & (1U << 26)) != 0;
-        if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 || (add && (flags & (7U << 20)))) {
-            return;
-        }
-    }
+    NativeQmdScheduler scheduler;
+    /// Inline QMDs (method 0x107) still queued for the back: what memory will hold.
+    struct InlineQmd {
+        u64 position;
+        NativeQmdScheduler::Descriptor words;
+    };
+    std::unordered_map<u64, InlineQmd> inline_qmds;
+};
+
+FrontQmdShadow& QmdShadow() {
+    static FrontQmdShadow shadow;
+    return shadow;
+}
+} // Anonymous namespace
+
+void KeplerCompute::FrontPredictQmd(FrontState& fs, u64 qmd_address, u32 argument) {
+    auto& shadow = QmdShadow();
     auto& predicted = Tegra::Nx2PredictedAdds::Get();
-    for (const u32 base : slots) {
-        const u32 flags = qmd[base + 1];
-        if (!(flags & (1U << 23)) || !(flags & (1U << 26))) {
-            continue;
+    auto& split = VideoCommon::GpuSplit::Get();
+    bool diverged = false;
+    const auto read = [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+        if (const auto it = shadow.inline_qmds.find(address); it != shadow.inline_qmds.end()) {
+            if (it->second.position > split.ConsumedNow()) {
+                descriptor = it->second.words;
+                return true;
+            }
+            shadow.inline_qmds.erase(it);
         }
-        const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
-        if (const auto device = memory_manager.GpuToCpuAddress(destination)) {
-            fs.verify_seq = predicted.Predict(*device, qmd[base + 2]);
+        const auto device = memory_manager.GpuToCpuAddress(address);
+        if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) {
+            return false; // The back fails the same way.
         }
+        if (!device || split.HasQueuedWritesTo(*device, sizeof(descriptor))) {
+            diverged = true; // The back may read other words: stop predicting.
+            return false;
+        }
+        memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+        return true;
+    };
+    const auto release = [&](u64 address, u32 payload, u32 flags) {
+        if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) {
+            return false;
+        }
+        // Adds land as an increment whatever else lands before them; max and plain releases
+        // aren't predicted.
+        if ((flags & (1U << 26)) && !(flags & (1U << 19))) {
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                fs.verify_seq = predicted.Predict(*device, payload);
+            }
+        }
+        return true;
+    };
+    const auto dispatch = [](const auto&) { return true; };
+    const auto error = shadow.scheduler.Signal(qmd_address, argument, read, release, dispatch);
+    // The back's scheduler meets the same errors with the same QMDs (and goes on); only a QMD
+    // the copy couldn't read as the back will makes them part ways.
+    (void)error;
+    if (diverged) {
+        predicted.Disable("a QMD the back reads is still being written");
     }
 }
 
@@ -1163,33 +1201,23 @@ void KeplerCompute::FrontPredictLaunch(FrontState& fs, u32 method, u32 argument)
     }
     const auto& front_regs = fs.registers;
     if (method == 0x107) {
-        // The inline QMD: written to memory, then launched as 0xb0 action 3 (ProcessNativeMethod).
-        if (!((front_regs[0xa7] & (1U << 24)) || !(front_regs[0xcc] & (1U << 12)))) {
-            return;
-        }
+        // As ProcessNativeMethod: the inline QMD is written to memory, then launched as 0xb0
+        // action 3 unless held.
         const u64 address = ((u64{front_regs[0xc6]} << 32) | front_regs[0xc7]) << 8;
-        FrontPredictQmd(fs, address, front_regs.data() + 0xc8);
+        auto& entry = QmdShadow().inline_qmds[address];
+        entry.position = VideoCommon::GpuSplit::Get().WritePosition();
+        std::copy_n(front_regs.data() + 0xc8, entry.words.size(), entry.words.begin());
+        if ((front_regs[0xa7] & (1U << 24)) || !(front_regs[0xcc] & (1U << 12))) {
+            FrontPredictQmd(fs, address, 3);
+        }
         return;
     }
-    if (method == 0xaf && !(argument & 2)) {
+    // As ProcessNativeMethod's QMD control methods.
+    if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+        (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
         return;
     }
-    const u64 address = u64{front_regs[0xad]} << 8;
-    const u32 action = argument & 15;
-    if (action == 7 || action == 12) {
-        fs.dependency_qmds.insert(address);
-        return;
-    }
-    if (method != 0xb0 || action != 3) {
-        return;
-    }
-    const auto device = memory_manager.GpuToCpuAddress(address);
-    if (!device || VideoCommon::GpuSplit::Get().HasQueuedWritesTo(*device, 256)) {
-        return;
-    }
-    std::array<u32, 64> qmd{};
-    memory_manager.ReadBlockUnsafe(address, qmd.data(), sizeof(qmd));
-    FrontPredictQmd(fs, address, qmd.data());
+    FrontPredictQmd(fs, u64{front_regs[0xad]} << 8, argument);
 }
 
 void KeplerCompute::FrontAfterSend(VideoCommon::GpuSplit& split, FrontState& fs) {

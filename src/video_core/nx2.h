@@ -12,6 +12,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -146,6 +147,12 @@ public:
     }
     /// Back, after the launch that came with predictions up to `seq` ran.
     void Verify(u64 seq);
+    /// Front: its copy of the scheduler can't follow the back's any more.
+    void Disable(const std::string& why) {
+        if (!disabled.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(HW_GPU, "QMD release predictions off: {}", why);
+        }
+    }
     /// A matched release landing: `write` writes the word.
     template <typename Func>
     void Land(u64 device_address, u32 payload, Func&& write) {

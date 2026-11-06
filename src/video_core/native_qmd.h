@@ -32,14 +32,14 @@ public:
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) {
+            if (table->size() >= 4096 && !table->contains(request.address)) {
                 // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
-                std::erase_if(states, [](const auto& entry) {
+                std::erase_if(*table, [](const auto& entry) {
                     return entry.second.completed && entry.second.deferred == 0;
                 });
-                if (states.size() >= 4096) return "QMD cache limit";
+                if (table->size() >= 4096) return "QMD cache limit";
             }
-            auto& state = states[request.address];
+            auto& state = (*table)[request.address];
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
                     if (!read(request.address, state.descriptor)) return "unmapped QMD";
@@ -135,5 +135,14 @@ private:
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
     static inline std::unordered_map<Address, State> states;
+    std::unordered_map<Address, State> own_states;
+    std::unordered_map<Address, State>* table{&states};
+
+public:
+    /// A scheduler with its own QMD table instead of the shared one (the split front's copy,
+    /// which predicts what the back's scheduler will run).
+    void UseOwnTable() {
+        table = &own_states;
+    }
 };
 } // namespace Tegra

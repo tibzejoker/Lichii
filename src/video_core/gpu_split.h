@@ -195,6 +195,10 @@ public:
             words -= count;
         }
     }
+    /// Front: the ring position of what it sends next.
+    [[nodiscard]] u64 WritePosition() const {
+        return write_position;
+    }
     /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
     [[nodiscard]] u64 ConsumedNow() {
         return consumed.load(std::memory_order_acquire);
