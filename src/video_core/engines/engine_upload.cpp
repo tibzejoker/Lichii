@@ -9,6 +9,7 @@
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/raster_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -33,6 +34,12 @@ void State::ProcessExec(const bool is_linear_) {
     is_linear = is_linear_;
 }
 
+void State::InlineToMemory(GPUVAddr address, std::span<const u8> data) {
+    rasterizer->AccelerateInlineToMemory(address, data.size(), data);
+    // With the raster stage the write may still be queued: the back's reads see it meanwhile.
+    VideoCommon::RasterSplit::Get().NoteIfQueued(&memory_manager, address, data);
+}
+
 void State::ProcessData(const u32 data, const bool is_last_call) {
     const u32 sub_copy_size = (std::min)(4U, copy_size - write_offset);
     std::memcpy(&inner_buffer[write_offset], &data, sub_copy_size);
@@ -43,8 +50,8 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const u32 count = write_offset - flushed_offset;
         if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
-                std::span<const u8>{inner_buffer.data() + flushed_offset, count});
+            InlineToMemory(regs.dest.Address() + flushed_offset,
+                           std::span<const u8>{inner_buffer.data() + flushed_offset, count});
             flushed_offset = write_offset;
         }
         return;
@@ -56,8 +63,8 @@ void State::ProcessData(const u32* data, size_t num_data) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const auto count = std::min<size_t>(num_data * sizeof(u32), copy_size - write_offset);
         if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + write_offset, count,
-                std::span<const u8>{reinterpret_cast<const u8*>(data), count});
+            InlineToMemory(regs.dest.Address() + write_offset,
+                           std::span<const u8>{reinterpret_cast<const u8*>(data), count});
             write_offset += static_cast<u32>(count);
             flushed_offset = write_offset;
         }
@@ -74,7 +81,7 @@ void State::ProcessData(std::span<const u8> read_buffer) {
             const GPUVAddr dest_line = address + line * regs.dest.pitch;
             std::span<const u8> buffer(read_buffer.data() + line * regs.line_length_in,
                                        regs.line_length_in);
-            rasterizer->AccelerateInlineToMemory(dest_line, regs.line_length_in, buffer);
+            InlineToMemory(dest_line, buffer);
         }
     } else {
         u32 width = regs.dest.width;

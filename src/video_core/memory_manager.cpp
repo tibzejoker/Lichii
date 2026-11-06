@@ -11,6 +11,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -42,6 +43,33 @@ void RasterBeforeAccess(bool write) {
     if (write || raster.pending_memory_writes.load(std::memory_order_relaxed) != 0) {
         raster.Drain();
     }
+}
+/// A read by the split's back of [address, address + size) while the raster thread has guest
+/// writes queued: true when the caller should overlay the queued words on what it read
+/// (`can_overlay`); otherwise, if the read overlaps one, waits for it.
+bool RasterBeforeRead(const void* owner, u64 address, u64 size, bool can_overlay) {
+    auto& raster = VideoCommon::RasterSplit::Get();
+    if (!raster.Active() || VideoCommon::RasterSplit::inline_depth != 0 || !raster.OnProducer()) {
+        return false;
+    }
+    const u32 queued = raster.pending_memory_writes.load(std::memory_order_acquire);
+    if (queued == 0) {
+        return false;
+    }
+    bool exact = false;
+    if (!raster.PendingWriteOverlaps(owner, address, size, exact)) {
+        if (exact && raster.PendingWriteCount() >= queued) {
+            return false;
+        }
+        // A queued write nobody noted: wait for all of them, as before.
+        raster.Drain();
+        return false;
+    }
+    if (can_overlay && exact && raster.PendingWriteCount() >= queued) {
+        return true;
+    }
+    raster.Drain();
+    return false;
 }
 } // Anonymous namespace
 bool MemoryManager::IsShuttingDown() const {
@@ -337,7 +365,7 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
 
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
-    RasterBeforeAccess(false);
+    const bool overlay = RasterBeforeRead(this, addr, sizeof(T), true);
     if constexpr (sizeof(T) == sizeof(u32)) {
         const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
         if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
@@ -347,11 +375,15 @@ T MemoryManager::Read(GPUVAddr addr) const {
         }
     }
 
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
-        T value;
-        std::memcpy(&value, page_pointer, sizeof(T));
-        return value;
+    if (const auto device = GpuToCpuAddress(addr)) {
+        if (const u8* const page_pointer = memory.GetPointer<u8>(*device)) {
+            T value;
+            std::memcpy(&value, page_pointer, sizeof(T));
+            if (overlay) [[unlikely]] {
+                VideoCommon::RasterSplit::Get().OverlayPendingWrites(this, addr, sizeof(T), &value);
+            }
+            return value;
+        }
     }
 
     static std::atomic<u32> reported{};
@@ -390,6 +422,7 @@ template void MemoryManager::Write<u32>(GPUVAddr addr, u32 data);
 template void MemoryManager::Write<u64>(GPUVAddr addr, u64 data);
 
 u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) {
+    RasterBeforeAccess(true);
     const auto address{GpuToCpuAddress(gpu_addr)};
     if (!address) {
         return {};
@@ -399,6 +432,7 @@ u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) {
 }
 
 const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
+    RasterBeforeRead(this, gpu_addr, 16, false);
     const auto address{GpuToCpuAddress(gpu_addr)};
     if (!address) {
         return {};
@@ -481,7 +515,13 @@ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t si
 }
 
 void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) const {
-    RasterBeforeAccess(false);
+    const bool overlay = RasterBeforeRead(this, gpu_src_addr, size, true);
+    void* const out_begin = dest_buffer;
+    SCOPE_EXIT {
+        if (overlay) {
+            VideoCommon::RasterSplit::Get().OverlayPendingWrites(this, gpu_src_addr, size, out_begin);
+        }
+    };
     if (!IsWithinGPUAddressRange(gpu_src_addr) || size > address_space_size - gpu_src_addr) {
         std::memset(dest_buffer, 0, size);
         return;
@@ -536,9 +576,16 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
     // in title 1). Anything else, unmapped or sparse pages included, takes the full path.
     constexpr std::size_t SmallPage = 0x1000;
     if (size <= SmallPage && (gpu_src_addr & (SmallPage - 1)) + size <= SmallPage) {
-        if (const u8* const pointer = GetPointer(gpu_src_addr)) {
-            std::memcpy(dest_buffer, pointer, size);
-            return;
+        const bool overlay = RasterBeforeRead(this, gpu_src_addr, size, true);
+        if (const auto device = GpuToCpuAddress(gpu_src_addr)) {
+            if (const u8* const pointer = memory.GetPointer<u8>(*device)) {
+                std::memcpy(dest_buffer, pointer, size);
+                if (overlay) [[unlikely]] {
+                    VideoCommon::RasterSplit::Get().OverlayPendingWrites(this, gpu_src_addr, size,
+                                                                         dest_buffer);
+                }
+                return;
+            }
         }
     }
     ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
@@ -1011,6 +1058,8 @@ void MemoryManager::FlushCaching() {
 }
 
 const u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size) const {
+    // Spans read or write guest memory directly, past ReadBlock and WriteBlock.
+    RasterBeforeRead(this, src_addr, size, false);
     if (!IsContinuousRange(src_addr, size)) {
         return nullptr;
     }
@@ -1022,6 +1071,7 @@ const u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size
 }
 
 u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size) {
+    RasterBeforeAccess(true);
     if (!IsContinuousRange(src_addr, size)) {
         return nullptr;
     }

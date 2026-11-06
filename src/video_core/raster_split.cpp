@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 
 #if defined(_MSC_VER) || defined(__x86_64__)
 #include <immintrin.h>
@@ -53,6 +54,9 @@ void RasterSplit::Start(Core::System& system_) {
     marked = 0;
     sent.store(0, std::memory_order_relaxed);
     done.store(0, std::memory_order_relaxed);
+    pending_writes.clear();
+    pending_pages.clear();
+    pending_mixed = false;
     producer = std::this_thread::get_id();
     thread = std::jthread([this](std::stop_token stop_token) { Loop(stop_token); });
     active.store(true, std::memory_order_release);
@@ -129,6 +133,75 @@ void RasterSplit::FlushDeltas() {
         range.split->delta_applied.store(range.end, std::memory_order_release);
     };
     Commit();
+}
+
+void RasterSplit::NotePendingWrite(const void* memory_owner, u64 address, std::span<const u8> data) {
+    if (data.empty()) {
+        return;
+    }
+    PrunePendingWrites();
+    if (pending_writes.empty()) {
+        pending_owner = memory_owner;
+        pending_mixed = false;
+    } else if (pending_owner != memory_owner) {
+        pending_mixed = true;
+    }
+    const u64 end = address + data.size();
+    for (u64 page = address >> 12; page <= (end - 1) >> 12; ++page) {
+        ++pending_pages[page];
+    }
+    pending_writes.push_back({memory_owner, address, end, sent.load(std::memory_order_relaxed),
+                              std::vector<u8>(data.begin(), data.end())});
+}
+
+void RasterSplit::PrunePendingWrites() {
+    const u64 completed = done.load(std::memory_order_acquire);
+    while (!pending_writes.empty() && pending_writes.front().task <= completed) {
+        const PendingWrite& write = pending_writes.front();
+        for (u64 page = write.begin >> 12; page <= (write.end - 1) >> 12; ++page) {
+            if (const auto it = pending_pages.find(page); it != pending_pages.end() && --it->second == 0) {
+                pending_pages.erase(it);
+            }
+        }
+        pending_writes.pop_front();
+    }
+}
+
+bool RasterSplit::PendingWriteOverlaps(const void* memory_owner, u64 address, u64 size, bool& exact) {
+    PrunePendingWrites();
+    exact = !pending_mixed && (pending_writes.empty() || pending_owner == memory_owner);
+    if (!exact) {
+        return true;
+    }
+    if (size == 0) {
+        return false;
+    }
+    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
+        if (pending_pages.contains(page)) {
+            for (const PendingWrite& write : pending_writes) {
+                if (write.begin < address + size && address < write.end) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+void RasterSplit::OverlayPendingWrites(const void* memory_owner, u64 address, u64 size, void* out) const {
+    u8* const bytes = static_cast<u8*>(out);
+    for (const PendingWrite& write : pending_writes) {
+        if (write.owner != memory_owner) {
+            continue;
+        }
+        const u64 begin = (std::max)(write.begin, address);
+        const u64 end = (std::min)(write.end, address + size);
+        if (begin < end) {
+            std::memcpy(bytes + (begin - address), write.data.data() + (begin - write.begin),
+                        end - begin);
+        }
+    }
 }
 
 void RasterSplit::Drain() {

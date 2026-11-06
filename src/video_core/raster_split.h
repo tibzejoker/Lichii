@@ -6,6 +6,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstddef>
+#include <deque>
+#include <unordered_map>
+#include <span>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -128,6 +131,27 @@ public:
     /// Guest memory writes still queued for the raster thread (constant buffer data).
     std::atomic<u32> pending_memory_writes{};
 
+    /// Producer, right after queueing a guest memory write of `data` at `address` of `owner`
+    /// (a memory manager): reads of it on the producer see `data` before the raster thread
+    /// writes it (OverlayPendingWrites) instead of draining.
+    void NotePendingWrite(const void* memory_owner, u64 address, std::span<const u8> data);
+    /// Producer: whether a read of [address, address + size) of `owner` overlaps a write still
+    /// queued. `exact` is false when one of another owner is queued (the caller drains).
+    [[nodiscard]] bool PendingWriteOverlaps(const void* memory_owner, u64 address, u64 size, bool& exact);
+    /// Producer: applies the queued writes to the bytes read at `address`, oldest first.
+    void OverlayPendingWrites(const void* memory_owner, u64 address, u64 size, void* out) const;
+    [[nodiscard]] u32 PendingWriteCount() const {
+        return static_cast<u32>(pending_writes.size());
+    }
+    /// Set by the proxy when it queued an inline write; NoteIfQueued notes it and clears it.
+    static inline thread_local bool last_write_queued{};
+    void NoteIfQueued(const void* memory_owner, u64 address, std::span<const u8> data) {
+        if (last_write_queued) {
+            last_write_queued = false;
+            NotePendingWrite(memory_owner, address, data);
+        }
+    }
+
     /// The rasterizer's idle hook (submits deferred work), run by the raster thread when idle.
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;
@@ -172,6 +196,18 @@ private:
     std::atomic<u64> delta_applied{};       ///< Raster: deltas applied
     std::atomic<u64> back_done{};           ///< Raster: back ring position fully done
     u64 marked{};                           ///< Producer: last marked back position
+    struct PendingWrite {
+        const void* owner;
+        u64 begin;
+        u64 end;
+        u64 task; ///< Landed once `done` reaches it
+        std::vector<u8> data;
+    };
+    std::deque<PendingWrite> pending_writes; ///< Producer only
+    std::unordered_map<u64, u32> pending_pages; ///< 4 KiB page -> pending writes touching it
+    const void* pending_owner{};               ///< Owner of every pending write, or null
+    bool pending_mixed{};                      ///< Pending writes of several owners
+    void PrunePendingWrites();
     std::atomic<u64> sent{};
     std::atomic<u64> done{};
     std::atomic<u32> wake{};

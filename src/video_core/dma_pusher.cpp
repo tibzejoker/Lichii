@@ -138,7 +138,13 @@ bool DmaPusher::Step() {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
-            if (kepler_payload || macro_payload) {
+            // With the split's front running the 3D macros, the back never reads a 3D macro's
+            // dirty flag (only HLE macros on the back do): skip the cache query, which drains
+            // the raster stage when that runs.
+            const bool front_runs_macro = macro_payload &&
+                                          VideoCommon::GpuSplit::Get().Active() &&
+                                          VideoCommon::GpuSplit::Get().FrontMacros();
+            if (kepler_payload || (macro_payload && !front_runs_macro)) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {

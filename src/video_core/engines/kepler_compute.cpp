@@ -27,6 +27,7 @@
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/raster_split.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
@@ -305,8 +306,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             LOG_ERROR(HW_GPU, "Unmapped native inline QMD destination");
             return true;
         }
-        rasterizer->AccelerateInlineToMemory(address, 256,
-            std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
+        const std::span<const u8> qmd{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256};
+        rasterizer->AccelerateInlineToMemory(address, 256, qmd);
+        // Read back right below: with the raster stage the write may still be queued.
+        VideoCommon::RasterSplit::Get().NoteIfQueued(&memory_manager, address, qmd);
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
             native_registers[0xad] = static_cast<u32>(address >> 8);

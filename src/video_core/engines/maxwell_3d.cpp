@@ -919,6 +919,8 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
                 VideoCommon::RasterSplit::Get().pending_memory_writes.fetch_sub(
                     1, std::memory_order_relaxed);
             });
+            raster.NotePendingWrite(&memory_manager, address,
+                                    {reinterpret_cast<const u8*>(start_base), write_size});
         } else {
             memory_manager.WriteBlockCached(address, start_base, write_size);
         }

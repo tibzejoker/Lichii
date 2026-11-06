@@ -80,6 +80,8 @@ public:
 
 private:
     void ProcessData(std::span<const u8> read_buffer);
+    /// AccelerateInlineToMemory, noting the write for the raster stage (RasterSplit).
+    void InlineToMemory(GPUVAddr address, std::span<const u8> data);
 
     bool native_partial{};
     u32 flushed_offset{};

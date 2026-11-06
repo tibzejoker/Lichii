@@ -110,6 +110,7 @@ public:
                 VideoCommon::RasterSplit::Get().pending_memory_writes.fetch_sub(
                     1, std::memory_order_relaxed);
             });
+            VideoCommon::RasterSplit::last_write_queued = true;
             // EDEN_NX2_RASTER_INLINE_DRAIN=1 (bisecting): wait for it right away.
             static const bool drain_now = std::getenv("EDEN_NX2_RASTER_INLINE_DRAIN") != nullptr;
             if (drain_now) {
