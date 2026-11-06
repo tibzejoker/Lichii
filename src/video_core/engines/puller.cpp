@@ -74,6 +74,8 @@ void ReleaseFences(DmaPusher& dma_pusher) {
 
 } // Anonymous namespace
 
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
+
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
     case GpuSemaphoreOperation::AcquireEqual:
@@ -258,6 +260,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (u32 word{}; SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
+                        acquire.Matches(word)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -382,6 +388,38 @@ static void NoteSemaphoreWrite(DmaPusher& dma_pusher, GPUVAddr address,
         split.NoteAsyncWrite(*device, 16);
         split.NoteMemoryWrite(*device, 16, "semaphore (timed)");
     }
+}
+
+// EXPERIMENT (not for nx2): EDEN_NX2_QMD_PREDICT=1. Whether the acquired word can be read without
+// draining the back: not GPU-written, no counter report still landing, with the queued releases
+// the front knows and the compute adds it predicted on top.
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !Nx2PredictedAdds::Wanted()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2IsGpuWritten(*device)) {
+        return false;
+    }
+    if (const u64 async_position = split.HasAsyncWrite(*device, 4);
+        async_position != 0 &&
+        (async_position > split.ConsumedNow() || !Nx2AsyncReportsSettled(*device, 4))) {
+        return false;
+    }
+    {
+        const u64 since = split.ConsumedNow();
+        word = Nx2PredictedAdds::Get().Read(
+            *device, [&] { return dma_pusher.memory_manager.Read<u32>(address); });
+        if (split.OverlayQueuedWrites(since, *device, &word, 1)) {
+            return true;
+        }
+    }
+    if (!split.WaitForWritesTo(*device, 16)) {
+        return false;
+    }
+    word = dma_pusher.memory_manager.Read<u32>(address);
+    return true;
 }
 
 /// Calls a GPU puller method.

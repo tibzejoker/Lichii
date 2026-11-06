@@ -368,9 +368,20 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = memory_manager.Read<u32>(address) + payload;
-                        memory_manager.Write<u32>(address, value);
+                    const auto release_device = memory_manager.GpuToCpuAddress(address);
+                    const bool predicted = release_device &&
+                        Tegra::Nx2PredictedAdds::Get().Match(*release_device, payload);
+                    rasterizer->SignalFence([this, address, payload, release_device, predicted] {
+                        u32 value{};
+                        const auto write = [&] {
+                            value = memory_manager.Read<u32>(address) + payload;
+                            memory_manager.Write<u32>(address, value);
+                        };
+                        if (predicted) {
+                            Tegra::Nx2PredictedAdds::Get().Land(*release_device, payload, write);
+                        } else {
+                            write();
+                        }
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
                         }
@@ -1110,7 +1121,83 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    u64 verify_seq{};                         ///< Predictions to verify after the next send
+    std::unordered_set<u64> dependency_qmds;  ///< QMDs with dependency counts: not predicted
 };
+
+void KeplerCompute::FrontPredictQmd(FrontState& fs, u64 qmd_address, const u32* qmd) {
+    if (fs.dependency_qmds.contains(qmd_address)) {
+        return;
+    }
+    // As NativeQmdScheduler::Signal: a QMD 3.0 without dependencies runs at once.
+    if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100) || ((qmd[4] >> 14) & 0xffff) != 0) {
+        return;
+    }
+    constexpr std::array<u32, 3> slots{24, 28, 52};
+    for (const u32 base : slots) {
+        const u32 flags = qmd[base + 1];
+        if (!(flags & (1U << 23))) {
+            continue;
+        }
+        const bool add = (flags & (1U << 26)) != 0;
+        if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 || (add && (flags & (7U << 20)))) {
+            return;
+        }
+    }
+    auto& predicted = Tegra::Nx2PredictedAdds::Get();
+    for (const u32 base : slots) {
+        const u32 flags = qmd[base + 1];
+        if (!(flags & (1U << 23)) || !(flags & (1U << 26))) {
+            continue;
+        }
+        const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | qmd[base];
+        if (const auto device = memory_manager.GpuToCpuAddress(destination)) {
+            fs.verify_seq = predicted.Predict(*device, qmd[base + 2]);
+        }
+    }
+}
+
+void KeplerCompute::FrontPredictLaunch(FrontState& fs, u32 method, u32 argument) {
+    if (!Tegra::Nx2PredictedAdds::Wanted() || !Tegra::Nx2PredictedAdds::Get().Enabled()) {
+        return;
+    }
+    const auto& front_regs = fs.registers;
+    if (method == 0x107) {
+        // The inline QMD: written to memory, then launched as 0xb0 action 3 (ProcessNativeMethod).
+        if (!((front_regs[0xa7] & (1U << 24)) || !(front_regs[0xcc] & (1U << 12)))) {
+            return;
+        }
+        const u64 address = ((u64{front_regs[0xc6]} << 32) | front_regs[0xc7]) << 8;
+        FrontPredictQmd(fs, address, front_regs.data() + 0xc8);
+        return;
+    }
+    if (method == 0xaf && !(argument & 2)) {
+        return;
+    }
+    const u64 address = u64{front_regs[0xad]} << 8;
+    const u32 action = argument & 15;
+    if (action == 7 || action == 12) {
+        fs.dependency_qmds.insert(address);
+        return;
+    }
+    if (method != 0xb0 || action != 3) {
+        return;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device || VideoCommon::GpuSplit::Get().HasQueuedWritesTo(*device, 256)) {
+        return;
+    }
+    std::array<u32, 64> qmd{};
+    memory_manager.ReadBlockUnsafe(address, qmd.data(), sizeof(qmd));
+    FrontPredictQmd(fs, address, qmd.data());
+}
+
+void KeplerCompute::FrontAfterSend(VideoCommon::GpuSplit& split, FrontState& fs) {
+    if (fs.verify_seq != 0) {
+        split.Defer([seq = fs.verify_seq] { Tegra::Nx2PredictedAdds::Get().Verify(seq); });
+        fs.verify_seq = 0;
+    }
+}
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
@@ -1136,6 +1223,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (method == 0x107 || method == 0xaf || method == 0xb0) {
+        FrontPredictLaunch(fs, method, argument);
+    }
     switch (method) {
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
@@ -1199,6 +1289,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    FrontAfterSend(split, fs);
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1217,6 +1308,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    FrontAfterSend(split, fs);
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1238,6 +1330,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        FrontAfterSend(split, fs);
         return true;
     };
 #ifdef ARCHITECTURE_x86_64
