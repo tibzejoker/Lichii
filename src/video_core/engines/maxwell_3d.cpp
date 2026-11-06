@@ -17,6 +17,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/raster_split.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -353,11 +354,50 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
     if (raster_twin != nullptr) {
-        raster_twin->ApplyRasterDelta(method, argument);
+        if (auto& raster = VideoCommon::RasterSplit::Get(); raster.OnProducer()) {
+            raster.QueueDelta(raster_twin, method, argument);
+        } else {
+            raster_twin->ApplyRasterDelta(method, argument);
+        }
     }
 }
 
 void Maxwell3D::SyncRasterTwinImpl() {
+    if (auto& raster = VideoCommon::RasterSplit::Get(); raster.OnProducer()) {
+        // The raster thread applies the copy in order, before the work that reads it.
+        struct Snapshot {
+            Maxwell3D* twin;
+            Regs::ConstantBuffer const_buffer;
+            decltype(Regs::load_mme) load_mme;
+            u32 shadow_scratch0;
+            DrawManager::State draw_state;
+            DrawManager::DrawTextureState draw_texture_state;
+            DrawManager::IndirectParams indirect_state;
+            State state;
+            RootTables root_tables;
+            bool execute_on;
+            decltype(dirty.flags) flags;
+        };
+        auto snapshot = std::make_unique<Snapshot>(Snapshot{
+            raster_twin, regs.const_buffer, regs.load_mme, regs.shadow_scratch[0],
+            draw_manager.draw_state, draw_manager.draw_texture_state, draw_manager.indirect_state,
+            state, root_tables, execute_on, dirty.flags});
+        dirty.flags.reset();
+        raster.Defer([s = std::move(snapshot)] {
+            Maxwell3D& twin = *s->twin;
+            twin.regs.const_buffer = s->const_buffer;
+            twin.regs.load_mme = s->load_mme;
+            twin.regs.shadow_scratch[0] = s->shadow_scratch0;
+            twin.draw_manager.draw_state = std::move(s->draw_state);
+            twin.draw_manager.draw_texture_state = s->draw_texture_state;
+            twin.draw_manager.indirect_state = s->indirect_state;
+            twin.state = s->state;
+            twin.root_tables = s->root_tables;
+            twin.execute_on = s->execute_on;
+            twin.dirty.flags |= s->flags;
+        });
+        return;
+    }
     Maxwell3D& twin = *raster_twin;
     // Registers written outside ProcessDirtyRegisters.
     twin.regs.const_buffer = regs.const_buffer;
@@ -845,7 +885,19 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        memory_manager.WriteBlockCached(address, start_base, write_size);
+        if (auto& raster = VideoCommon::RasterSplit::Get();
+            raster.OnProducer() && (VideoCommon::RasterSplit::AsyncGroups() & 8) != 0) {
+            // Draws still queued for the raster thread read the words there before this write.
+            raster.pending_memory_writes.fetch_add(1, std::memory_order_relaxed);
+            raster.Defer([memory = &memory_manager, address,
+                          words = std::vector<u32>(start_base, start_base + write_size / 4)] {
+                memory->WriteBlockCached(address, words.data(), words.size() * sizeof(u32));
+                VideoCommon::RasterSplit::Get().pending_memory_writes.fetch_sub(
+                    1, std::memory_order_relaxed);
+            });
+        } else {
+            memory_manager.WriteBlockCached(address, start_base, write_size);
+        }
     }
     if (write_size != copy_size) {
         static std::atomic<bool> warned{};

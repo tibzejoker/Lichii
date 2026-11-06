@@ -20,6 +20,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/raster_split.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
@@ -201,6 +202,7 @@ void GpuSplit::Publish() {
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
+        RasterSplit::Get().WaitSent();
         return;
     }
     Publish();
@@ -210,6 +212,7 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            RasterSplit::Get().WaitSent();
             Nx2Profile::AddDrain(site, start);
             return;
         }
@@ -330,6 +333,8 @@ bool GpuSplit::WaitForSync() {
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
+        // What the back sent to the raster thread for that work (inline uploads) too.
+        RasterSplit::Get().WaitSent();
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
@@ -340,6 +345,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            RasterSplit::Get().WaitSent();
             Nx2Profile::AddDrain(site, start);
             return true;
         }
@@ -454,6 +460,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    if (RasterSplit::Wanted()) {
+        RasterSplit::Get().SetIdleHook(idle_hook, idle_argument);
+        RasterSplit::Get().Start(*system);
+    }
+    // With the raster stage, the rasterizer's idle hook runs there.
+    const auto run_idle_hook = [this] {
+        if (RasterSplit::Get().Active()) {
+            RasterSplit::Get().RequestIdleHook();
+        } else {
+            idle_hook(idle_argument);
+        }
+    };
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
@@ -469,7 +487,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position && idle_hook != nullptr) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                run_idle_hook();
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -495,7 +513,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                run_idle_hook();
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).

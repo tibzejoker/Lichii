@@ -3296,8 +3296,6 @@ public:
         }
     }
 
-private:
-    void SyncRasterTwinImpl();
     /// A register change on the twin: the value and the dirty flags its tables map it to.
     void ApplyRasterDelta(u32 method, u32 argument) {
         regs.reg_array[method] = argument;
@@ -3305,6 +3303,9 @@ private:
             dirty.flags[table[method]] = true;
         }
     }
+
+private:
+    void SyncRasterTwinImpl();
     Maxwell3D* raster_twin{};
 
     void ConsumeSinkImpl(Core::System& system) override;

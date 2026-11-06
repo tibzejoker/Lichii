@@ -12,6 +12,7 @@
 
 #include "common/dynamic_library.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/raster_proxy.h"
 #include "video_core/renderer_base.h"
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/frame_gen.h"
@@ -52,6 +53,13 @@ public:
     std::vector<u8> GetAppletCaptureBuffer() override;
 
     VideoCore::RasterizerInterface* ReadRasterizer() override {
+        // EXPERIMENT (not for nx2): EDEN_NX2_RASTER_SPLIT=2 hands out the raster stage's proxy.
+        if (VideoCommon::RasterSplit::Wanted()) {
+            if (!raster_proxy) {
+                raster_proxy = std::make_unique<VideoCore::RasterProxy>(*&rasterizer);
+            }
+            return raster_proxy.get();
+        }
         return &rasterizer;
     }
 
@@ -108,6 +116,7 @@ private:
     BlitScreen blit_capture;
     BlitScreen blit_applet;
     RasterizerVulkan rasterizer;
+    std::unique_ptr<VideoCore::RasterProxy> raster_proxy;
 #ifdef HAS_LSFG
     FrameGen frame_gen;
 #endif

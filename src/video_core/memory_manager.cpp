@@ -23,11 +23,27 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
+#include "video_core/raster_split.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
 
 namespace Tegra {
+
+namespace {
+/// EDEN_NX2_RASTER_SPLIT=2: a guest memory access by the split's back while the raster thread
+/// still has work queued. A write waits for it (queued draws read memory as it was); a read waits
+/// for queued writes (constant buffer data).
+void RasterBeforeAccess(bool write) {
+    auto& raster = VideoCommon::RasterSplit::Get();
+    if (!raster.Active() || VideoCommon::RasterSplit::inline_depth != 0 || !raster.OnProducer()) {
+        return;
+    }
+    if (write || raster.pending_memory_writes.load(std::memory_order_relaxed) != 0) {
+        raster.Drain();
+    }
+}
+} // Anonymous namespace
 bool MemoryManager::IsShuttingDown() const {
     return system.IsShuttingDown();
 }
@@ -321,6 +337,7 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
 
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
+    RasterBeforeAccess(false);
     if constexpr (sizeof(T) == sizeof(u32)) {
         const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
         if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
@@ -347,6 +364,7 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    RasterBeforeAccess(true);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
@@ -463,6 +481,7 @@ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t si
 }
 
 void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) const {
+    RasterBeforeAccess(false);
     if (!IsWithinGPUAddressRange(gpu_src_addr) || size > address_space_size - gpu_src_addr) {
         std::memset(dest_buffer, 0, size);
         return;
@@ -538,6 +557,7 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
 }
 
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
+    RasterBeforeAccess(true);
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
@@ -980,6 +1000,7 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    RasterBeforeAccess(true);
     // Flush from the invalidate accumulator
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);

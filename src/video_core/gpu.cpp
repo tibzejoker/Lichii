@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/raster_split.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -292,6 +293,7 @@ struct GPU::Impl {
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
              composite_fences = std::move(fences)] {
                 if (num_fences == 0) {
+                    VideoCommon::RasterOwnerScope raster_owner;
                     renderer->Composite(composite_layers);
                     return;
                 }
@@ -304,6 +306,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
+                    VideoCommon::RasterOwnerScope raster_owner;
                     renderer->Composite(composite_layers);
                 };
                 for (size_t i = 0; i < num_fences; i++) {

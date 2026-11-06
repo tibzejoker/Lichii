@@ -77,6 +77,17 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// EDEN_NX2_RASTER_SPLIT=2: the raster thread owns the scheduler as the back did.
+    static void MarkBackThread() {
+        on_back_thread = true;
+    }
+    /// The rasterizer's idle hook, for the raster thread.
+    [[nodiscard]] void (*IdleHook() const)(void*) {
+        return idle_hook;
+    }
+    [[nodiscard]] void* IdleHookArgument() const {
+        return idle_argument;
+    }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
         idle_hook = hook;

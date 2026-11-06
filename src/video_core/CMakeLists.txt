@@ -103,6 +103,9 @@ add_library(video_core STATIC
     gpu.h
     gpu_timestamp.h
     gpu_split.cpp
+    raster_proxy.h
+    raster_split.cpp
+    raster_split.h
     gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
