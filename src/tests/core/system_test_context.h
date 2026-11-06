@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
@@ -15,13 +16,24 @@ public:
         if (!std::filesystem::create_directory(directory)) {
             throw std::runtime_error("Cannot create isolated System test directory");
         }
-        Common::FS::SetEdenPath(Common::FS::EdenPath::NANDDir, directory);
+        std::array<std::filesystem::path, paths.size()> next_paths;
+        for (size_t i = 0; i < paths.size(); ++i) {
+            previous_paths[i] = Common::FS::GetEdenPath(paths[i]);
+            next_paths[i] = directory / std::to_string(i);
+            std::filesystem::create_directory(next_paths[i]);
+        }
+        // Complete fallible filesystem setup before redirecting any global path.
+        for (size_t i = 0; i < paths.size(); ++i) {
+            Common::FS::SetEdenPath(paths[i], next_paths[i]);
+        }
         Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_4Gb);
         Settings::values.use_multi_core.SetValue(false);
     }
 
     ~ScopedSystemTestContext() {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::NANDDir, previous_nand);
+        for (size_t i = 0; i < paths.size(); ++i) {
+            Common::FS::SetEdenPath(paths[i], previous_paths[i]);
+        }
         Settings::values.current_user = previous_user;
         Settings::values.memory_layout_mode.SetValue(previous_memory);
         Settings::values.use_multi_core.SetValue(previous_multicore);
@@ -33,8 +45,12 @@ public:
     ScopedSystemTestContext& operator=(const ScopedSystemTestContext&) = delete;
 
 private:
-    const std::filesystem::path previous_nand =
-        Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+    static constexpr std::array paths{
+        Common::FS::EdenPath::NANDDir, Common::FS::EdenPath::SDMCDir,
+        Common::FS::EdenPath::LoadDir, Common::FS::EdenPath::DumpDir,
+        Common::FS::EdenPath::KeysDir, Common::FS::EdenPath::ConfigDir,
+    };
+    std::array<std::filesystem::path, paths.size()> previous_paths;
     const s32 previous_user = Settings::values.current_user.GetValue();
     const Settings::MemoryLayout previous_memory = Settings::values.memory_layout_mode.GetValue();
     const bool previous_multicore = Settings::values.use_multi_core.GetValue();

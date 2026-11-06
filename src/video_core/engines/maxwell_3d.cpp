@@ -1230,6 +1230,15 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+        method == MAXWELL3D_REG_INDEX(launch_dma)) {
+        // Each word executes, including words replaced by shadow RAM Replay. Track it after
+        // its own queue entry: a later short release must not hide an earlier async report.
+        for (u32 i = 0; i < amount; ++i) {
+            FrontWrite(split, fs, method, base_start[i], i + 1 == methods_pending, false);
+        }
+        return;
+    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1404,29 +1413,21 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             unknown("upload release");
         }
         fs.upload_known = device && linear && lines == 1 && (*device & 3) == 0 &&
-                          memory_manager.GpuToCpuAddress(address + size - 1) ==
-                              *device + size - 1;
+                          size != 0 && size <= (u64{64} << 20) &&
+                          memory_manager.IsContinuousRange(address, size);
         fs.upload_device = device.value_or(0);
         fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
         fs.upload_offset = 0;
         if (!fs.upload_known) {
-            if (!device || size == 0 || size > (u64{64} << 20)) {
-                return unknown("upload unmapped or huge");
-            }
-            split.NoteMemoryWrite(*device, size, "upload (not linear)");
+            // A non-contiguous GPU range may alias unrelated device pages in its middle.
+            // The first device address and size cannot bound all of those writes.
+            unknown("upload destination unknown");
         }
         return;
     }
     // inline_data words of the current upload.
     if (!fs.upload_known) {
-        const auto device = memory_manager.GpuToCpuAddress(
-            (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3]);
-        if (!device) {
-            return unknown("upload data unmapped");
-        }
-        split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
-                                           u64{fs.regs[base + 4]} * fs.regs[base + 1],
-                              "upload data");
+        unknown("upload data destination unknown");
         return;
     }
     const u32 remaining_bytes =

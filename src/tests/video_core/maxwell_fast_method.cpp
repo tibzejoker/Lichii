@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <random>
 #include <thread>
@@ -777,4 +778,166 @@ TEST_CASE("Split restart resets writer positions without replaying old releases"
         REQUIRE_FALSE(split.BackRunning());
         REQUIRE(Access::End(split) == 0);
     }
+}
+
+TEST_CASE("Front upload tracking rejects holes and middle aliases with matching endpoints",
+          "[video_core][gpu_split_write_guards]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    constexpr GPUVAddr address = 0x100000;
+    constexpr DAddr device = 0x10000;
+    constexpr DAddr middle_alias = 0x40000;
+    bool continuous = false;
+    bool middle_mapped = true;
+    SECTION("contiguous") { continuous = true; }
+    SECTION("middle alias") {}
+    SECTION("unmapped middle") { middle_mapped = false; }
+    f.memory.Map(address, device, 0x1000, Tegra::PTEKind::PITCH, false);
+    if (middle_mapped) {
+        f.memory.Map(address + 0x1000, continuous ? device + 0x1000 : middle_alias,
+                     0x1000, Tegra::PTEKind::PITCH, false);
+    }
+    f.memory.Map(address + 0x2000, device + 0x2000, 0x1000, Tegra::PTEKind::PITCH, false);
+    // Endpoints agree even when the middle is aliased or unmapped.
+    REQUIRE(f.memory.GpuToCpuAddress(address + 0x2fff) == device + 0x2fff);
+
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto state = [&](u32 method, u32 value) {
+        f.fast.FrontCallMethod(f.system, split, method, value, true);
+    };
+    constexpr u32 upload = MAXWELL3D_REG_INDEX(upload);
+    state(ShadowControl, 0);
+    state(upload, 0x3000);
+    state(upload + 1, 1);
+    state(upload + 2, 0);
+    state(upload + 3, address);
+    state(MAXWELL3D_REG_INDEX(launch_dma), 1);
+    const u64 launch_end = Access::End(split);
+    REQUIRE(split.HasQueuedWritesTo(middle_alias, 4) == !continuous);
+    const std::vector<u32> data(0x3000 / sizeof(u32), 0x12345678);
+    f.fast.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(inline_data),
+                               data.data(), static_cast<u32>(data.size()),
+                               static_cast<u32>(data.size()));
+    u32 result = 0;
+    // Ignore the launch entry: the data entry itself must also remain conservative.
+    REQUIRE(split.OverlayQueuedWrites(launch_end, continuous ? device + 0x1000 : middle_alias,
+                                      &result, 1) == continuous);
+    if (continuous) {
+        REQUIRE(result == data[0]);
+    }
+}
+
+TEST_CASE("Front upload tracking rejects empty overflowing and unmapped ranges",
+          "[video_core][gpu_split_write_guards]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    GPUVAddr address = 0x100000;
+    u32 size = 4;
+    bool mapped = true;
+    SECTION("zero bytes") { size = 0; }
+    SECTION("unmapped first page") { mapped = false; }
+    SECTION("GPU address space end") { address = 0xfffffffc; size = 8; }
+    SECTION("64 bit wrap") { address = std::numeric_limits<u64>::max() - 3; size = 8; mapped = false; }
+    if (mapped) {
+        f.memory.Map(address & ~GPUVAddr{0xfff}, 0x10000, 0x1000,
+                     Tegra::PTEKind::PITCH, false);
+    }
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto state = [&](u32 method, u32 value) {
+        f.fast.FrontCallMethod(f.system, split, method, value, true);
+    };
+    constexpr u32 upload = MAXWELL3D_REG_INDEX(upload);
+    state(ShadowControl, 0);
+    state(upload, size);
+    state(upload + 1, 1);
+    state(upload + 2, static_cast<u32>(address >> 32));
+    state(upload + 3, static_cast<u32>(address));
+    state(MAXWELL3D_REG_INDEX(launch_dma), 1);
+    REQUIRE(split.HasQueuedWritesTo(0x40000, 4));
+    const auto launch_end = Access::End(split);
+    state(MAXWELL3D_REG_INDEX(inline_data), 0x12345678);
+    u32 result = 0;
+    REQUIRE_FALSE(split.OverlayQueuedWrites(launch_end, 0x40000, &result, 1));
+}
+
+TEST_CASE("Front report batches track every executed query including Replay",
+          "[video_core][gpu_split_write_guards]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    constexpr GPUVAddr address = 0x100000;
+    constexpr DAddr device = 0x10000;
+    f.memory.Map(address, device, 0x1000, Tegra::PTEKind::PITCH, false);
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto state = [&](u32 method, u32 value) {
+        f.fast.FrontCallMethod(f.system, split, method, value, true);
+    };
+    constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
+    constexpr u32 query = MAXWELL3D_REG_INDEX(report_semaphore.query);
+    constexpr u32 short_release = 1U << 28;
+    constexpr u32 timed_release = 0;
+    state(ShadowControl, 0);
+    state(report, 0);
+    state(report + 1, address);
+    state(report + 2, 0x12345678);
+    std::array<u32, 2> queries{timed_release, short_release};
+    bool asynchronous = true;
+    SECTION("earlier timed query survives final short release") {}
+    SECTION("Replay executes timed queries instead of raw short releases") {
+        state(query, timed_release);
+        state(ShadowControl, 3);
+        queries = {short_release, short_release};
+    }
+    SECTION("Replay executes short releases instead of raw timed queries") {
+        state(query, short_release);
+        state(ShadowControl, 3);
+        queries = {timed_release, timed_release};
+        asynchronous = false;
+    }
+    const auto before = Access::End(split);
+    f.fast.FrontCallMultiMethod(f.system, split, query, queries.data(), 2, 2);
+    REQUIRE((split.HasAsyncWrite(device, 16) > before) == asynchronous);
+    u32 payload = 0;
+    REQUIRE(split.OverlayQueuedWrites(before, device, &payload, 1) == !asynchronous);
+    if (!asynchronous) {
+        REQUIRE(payload == 0x12345678);
+    }
+}
+
+TEST_CASE("Front upload launch batches preserve earlier releases and Replay layout",
+          "[video_core][gpu_split_write_guards]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    constexpr GPUVAddr address = 0x100000;
+    constexpr DAddr device = 0x10000;
+    f.memory.Map(address, device, 0x1000, Tegra::PTEKind::PITCH, false);
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const auto state = [&](u32 method, u32 value) {
+        f.fast.FrontCallMethod(f.system, split, method, value, true);
+    };
+    constexpr u32 upload = MAXWELL3D_REG_INDEX(upload);
+    constexpr u32 launch = MAXWELL3D_REG_INDEX(launch_dma);
+    state(ShadowControl, 0);
+    state(upload, 4);
+    state(upload + 1, 1);
+    state(upload + 2, 0);
+    state(upload + 3, address);
+    std::array<u32, 2> launches{0x21, 1};
+    SECTION("earlier launch releases a semaphore") {}
+    SECTION("Replay executes tiled launches instead of raw linear launches") {
+        state(launch, 0);
+        state(ShadowControl, 3);
+        launches = {1, 1};
+    }
+    const auto before = Access::End(split);
+    f.fast.FrontCallMultiMethod(f.system, split, launch, launches.data(), 2, 2);
+    u32 value = 0;
+    REQUIRE_FALSE(split.OverlayQueuedWrites(before, device, &value, 1));
 }
