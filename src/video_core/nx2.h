@@ -99,11 +99,14 @@ inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_com
     return true;
 }
 
-// EXPERIMENT (not for nx2): EDEN_NX2_SEM_FAST=3. Compute QMD "add" releases the split's front
-// predicts when it sends a QMD launch (it reads the QMD as the back will), by device address.
-// The back matches each release it queues against the predictions, and lands it (after its host
-// fence) under the same lock as Read; a prediction the back did not match once it ran the launch
-// is retracted and logged, and predictions stop after a few of those.
+// EXPERIMENT (not for nx2): EDEN_NX2_QMD_PREDICT=1. Compute QMD releases the split's front
+// predicts, by device address, as its copy of the QMD scheduler runs them: adds, max releases
+// (NVN2's QMD completion counters) and plain releases. The back matches each release it queues
+// against the oldest prediction there; adds and max releases land under the same lock as Read,
+// plain ones (query cache fences) once the report slot settled. A prediction the back did not
+// match once it ran the launch is retracted and logged, and predictions stop after a few.
+enum class Nx2Release : u8 { Add, Max, Set };
+
 class Nx2PredictedAdds {
 public:
     static Nx2PredictedAdds& Get() {
@@ -122,25 +125,24 @@ public:
         return !disabled.load(std::memory_order_relaxed);
     }
     /// Front: the launch it is about to send releases `payload` onto `device_address`.
-    u64 Predict(u64 device_address, u32 payload) {
+    u64 Predict(u64 device_address, Nx2Release kind, u32 payload) {
         std::scoped_lock lock{mutex};
         const u64 seq = ++next_seq;
-        predictions.push_back({seq, device_address, payload, false});
-        sums[device_address] += payload;
+        predictions.push_back({seq, device_address, payload, kind, State::Pending});
         any.store(true, std::memory_order_relaxed);
         return seq;
     }
-    /// Back, queueing a release add: whether it is the oldest unmatched prediction there.
-    bool Match(u64 device_address, u32 payload) {
+    /// Back, queueing a release: whether it is the oldest unmatched prediction there.
+    bool Match(u64 device_address, Nx2Release kind, u32 payload) {
         std::scoped_lock lock{mutex};
         for (Prediction& prediction : predictions) {
-            if (prediction.matched || prediction.address != device_address) {
+            if (prediction.state != State::Pending || prediction.address != device_address) {
                 continue;
             }
-            if (prediction.payload != payload) {
+            if (prediction.kind != kind || prediction.payload != payload) {
                 return false; // Verify retracts it
             }
-            prediction.matched = true;
+            prediction.state = State::Matched;
             return true;
         }
         return false;
@@ -153,41 +155,69 @@ public:
             LOG_WARNING(HW_GPU, "QMD release predictions off: {}", why);
         }
     }
-    /// A matched release landing: `write` writes the word.
+    /// A matched add or max release landing: `write` writes the word.
     template <typename Func>
-    void Land(u64 device_address, u32 payload, Func&& write) {
+    void Land(u64 device_address, Nx2Release kind, u32 payload, Func&& write) {
         std::scoped_lock lock{mutex};
         write();
-        Remove(device_address, payload);
+        for (Prediction& prediction : predictions) {
+            if (prediction.state == State::Matched && prediction.address == device_address &&
+                prediction.kind == kind && prediction.payload == payload) {
+                prediction.state = State::Done;
+                break;
+            }
+        }
+        Collect();
     }
-    /// `read()` plus the predicted adds that have not landed.
-    template <typename Func>
-    u32 Read(u64 device_address, Func&& read) {
+    /// `read()` with the predicted releases there that have not landed applied, in order.
+    template <typename Read, typename Settled>
+    u32 Value(u64 device_address, Read&& read, Settled&& settled) {
         if (!any.load(std::memory_order_relaxed)) {
             return read();
         }
         std::scoped_lock lock{mutex};
-        const auto it = sums.find(device_address);
-        return read() + (it != sums.end() ? it->second : 0);
+        u32 value = read();
+        for (Prediction& prediction : predictions) {
+            if (prediction.state == State::Done || prediction.address != device_address) {
+                continue;
+            }
+            if (prediction.kind == Nx2Release::Set && prediction.state == State::Matched &&
+                settled()) {
+                prediction.state = State::Done; // Landed (or about to: then the read waits)
+                continue;
+            }
+            switch (prediction.kind) {
+            case Nx2Release::Add:
+                value += prediction.payload;
+                break;
+            case Nx2Release::Max:
+                value = (std::max)(value, prediction.payload);
+                break;
+            case Nx2Release::Set:
+                value = prediction.payload;
+                break;
+            }
+        }
+        Collect();
+        return value;
     }
 
 private:
+    enum class State : u8 { Pending, Matched, Done };
     struct Prediction {
         u64 seq;
         u64 address;
         u32 payload;
-        bool matched;
+        Nx2Release kind;
+        State state;
     };
-    void Remove(u64 device_address, u32 payload) {
-        if (const auto it = sums.find(device_address); it != sums.end()) {
-            if ((it->second -= payload) == 0) {
-                sums.erase(it);
-            }
+    void Collect() {
+        while (!predictions.empty() && predictions.front().state == State::Done) {
+            predictions.pop_front();
         }
     }
     std::mutex mutex;
     std::deque<Prediction> predictions;
-    std::unordered_map<u64, u32> sums;
     u64 next_seq{};
     u32 mismatches{};
     std::atomic<bool> any{};
@@ -196,22 +226,25 @@ private:
 
 inline void Nx2PredictedAdds::Verify(u64 seq) {
     std::scoped_lock lock{mutex};
-    while (!predictions.empty() && predictions.front().seq <= seq) {
-        const Prediction prediction = predictions.front();
-        predictions.pop_front();
-        if (prediction.matched) {
+    for (Prediction& prediction : predictions) {
+        if (prediction.seq > seq) {
+            break;
+        }
+        if (prediction.state != State::Pending) {
             continue;
         }
-        Remove(prediction.address, prediction.payload);
+        prediction.state = State::Done;
         if (++mismatches <= 16) {
-            LOG_WARNING(HW_GPU, "Predicted QMD release +{:#x} at {:#x} did not happen ({} so far)",
-                        prediction.payload, prediction.address, mismatches);
+            LOG_WARNING(HW_GPU, "Predicted QMD release {:#x} ({}) at {:#x} did not happen ({} so far)",
+                        prediction.payload, static_cast<u32>(prediction.kind), prediction.address,
+                        mismatches);
         }
         if (mismatches == 16) {
             disabled.store(true, std::memory_order_relaxed);
             LOG_WARNING(HW_GPU, "QMD release predictions off");
         }
     }
+    Collect();
 }
 
 // Syncpoint increments sent through the split GPU thread (the puller's fence action, the 3D

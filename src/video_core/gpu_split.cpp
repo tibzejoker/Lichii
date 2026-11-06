@@ -274,7 +274,7 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
     const u64 end = begin + u64{words} * sizeof(u32);
     const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
     // Newest first, back to what the back had consumed before guest memory was read.
-    std::array<u32, 64> overlapping;
+    std::array<u32, 256> overlapping;
     u32 found = 0;
     u64 scanned = 0;
     for (; scanned < remembered; ++scanned) {

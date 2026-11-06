@@ -370,7 +370,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 if (flags & (1U << 26)) {
                     const auto release_device = memory_manager.GpuToCpuAddress(address);
                     const bool predicted = release_device &&
-                        Tegra::Nx2PredictedAdds::Get().Match(*release_device, payload);
+                        Tegra::Nx2PredictedAdds::Get().Match(*release_device,
+                                                             Tegra::Nx2Release::Add, payload);
                     rasterizer->SignalFence([this, address, payload, release_device, predicted] {
                         u32 value{};
                         const auto write = [&] {
@@ -378,7 +379,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                             memory_manager.Write<u32>(address, value);
                         };
                         if (predicted) {
-                            Tegra::Nx2PredictedAdds::Get().Land(*release_device, payload, write);
+                            Tegra::Nx2PredictedAdds::Get().Land(*release_device,
+                                                                Tegra::Nx2Release::Add, payload,
+                                                                write);
                         } else {
                             write();
                         }
@@ -399,11 +402,24 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                    const auto max_device = memory_manager.GpuToCpuAddress(address);
+                    const bool predicted = max_device &&
+                        Tegra::Nx2PredictedAdds::Get().Match(*max_device, Tegra::Nx2Release::Max,
+                                                             payload);
+                    rasterizer->SignalFence([this, address, payload, max_device, predicted] {
+                        u32 value{};
+                        const auto write = [&] {
+                            value = (std::max)(memory_manager.Read<u32>(address), payload);
+                            memory_manager.Write<u32>(address, value);
+                        };
+                        if (predicted) {
+                            Tegra::Nx2PredictedAdds::Get().Land(*max_device, Tegra::Nx2Release::Max,
+                                                                payload, write);
+                        } else {
+                            write();
+                        }
+                        if (max_device) {
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*max_device, value);
                         }
                     });
                 } else {
@@ -413,6 +429,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     }();
                     if (watch != 0 && (address & ~u64{0xf}) == (watch & ~u64{0xf})) {
                         LOG_INFO(HW_GPU, "Semaphore watch: QMD release {:#x} = {:#x} flags {:#x}", address, payload, flags);
+                    }
+                    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                        Tegra::Nx2PredictedAdds::Get().Match(*device, Tegra::Nx2Release::Set,
+                                                             payload);
                     }
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
@@ -1122,9 +1142,21 @@ struct KeplerCompute::FrontState {
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
     u64 verify_seq{}; ///< Predictions to verify after the next send
+    /// The inline upload being sent (registers 0x60-0x6d), for the split's queued-write notes.
+    bool upload_known{};
+    u64 upload_device{};
+    u32 upload_size{};
+    u32 upload_offset{};
 };
 
 namespace {
+u64 pitch_size(const std::array<u32, 0x1000>& front_regs, u64 size) {
+    const u64 line_length = front_regs[0x60];
+    const u64 lines = front_regs[0x61];
+    const u64 pitch = (std::max<u64>)(front_regs[0x64], line_length);
+    return lines == 0 ? size : pitch * (lines - 1) + line_length;
+}
+
 /// EXPERIMENT (not for nx2): EDEN_NX2_QMD_PREDICT=1. The split front's copy of the back's QMD
 /// scheduler: it gets the same signals, in the same order, with the QMDs as the back will read
 /// them, so the QMDs it runs are those the back will run. Shared by every channel, as the
@@ -1165,23 +1197,31 @@ void KeplerCompute::FrontPredictQmd(FrontState& fs, u64 qmd_address, u32 argumen
         if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) {
             return false; // The back fails the same way.
         }
-        if (!device || split.HasQueuedWritesTo(*device, sizeof(descriptor))) {
-            diverged = true; // The back may read other words: stop predicting.
+        if (!device) {
+            diverged = true;
             return false;
         }
+        // The QMD as the back will read it: with the queued writes the front knows on top
+        // (the SDK patches release payloads with inline uploads).
+        const u64 since = split.ConsumedNow();
         memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+        if (!split.OverlayQueuedWrites(since, *device, descriptor.data(),
+                                       static_cast<u32>(descriptor.size()))) {
+            diverged = true; // A queued write with unknown words: stop predicting.
+            return false;
+        }
         return true;
     };
     const auto release = [&](u64 address, u32 payload, u32 flags) {
         if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) {
             return false;
         }
-        // Adds land as an increment whatever else lands before them; max and plain releases
-        // aren't predicted.
-        if ((flags & (1U << 26)) && !(flags & (1U << 19))) {
-            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                fs.verify_seq = predicted.Predict(*device, payload);
-            }
+        // As the back releases them (ProcessNativeMethod): an add, a max or a plain write.
+        const auto kind = (flags & (1U << 26))   ? Tegra::Nx2Release::Add
+                          : (flags & (1U << 19)) ? Tegra::Nx2Release::Max
+                                                 : Tegra::Nx2Release::Set;
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            fs.verify_seq = predicted.Predict(*device, kind, payload);
         }
         return true;
     };
@@ -1193,6 +1233,38 @@ void KeplerCompute::FrontPredictQmd(FrontState& fs, u64 qmd_address, u32 argumen
     if (diverged) {
         predicted.Disable("a QMD the back reads is still being written");
     }
+}
+
+void KeplerCompute::FrontNoteUpload(FrontState& fs, u32 method, u32 argument) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const auto& front_regs = fs.registers;
+    if (method == 0x6c) {
+        // EXEC_UPLOAD: bit 0 linear. The words follow in DATA_UPLOAD.
+        const u64 line_length = front_regs[0x60];
+        const u64 lines = front_regs[0x61];
+        const GPUVAddr address = (GPUVAddr{front_regs[0x62]} << 32) | front_regs[0x63];
+        const u64 size = line_length * lines;
+        const auto device = memory_manager.GpuToCpuAddress(address);
+        fs.upload_known = device && (argument & 1) != 0 && lines == 1 && (*device & 3) == 0 &&
+                          size != 0 &&
+                          memory_manager.GpuToCpuAddress(address + size - 1) == *device + size - 1;
+        fs.upload_device = device.value_or(0);
+        fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
+        fs.upload_offset = 0;
+        if (!fs.upload_known && size != 0) {
+            if (device && size <= (u64{64} << 20) && (argument & 1) != 0) {
+                split.NoteMemoryWrite(*device, pitch_size(front_regs, size), "compute upload");
+            } else {
+                split.NoteMemoryWrite(0, ~u64{0}, "compute upload (tiled or unmapped)");
+            }
+        }
+        return;
+    }
+    if (!fs.upload_known || fs.upload_offset + 4 > fs.upload_size) {
+        return;
+    }
+    split.NoteMemoryWriteData(fs.upload_device + fs.upload_offset, &argument, 1);
+    fs.upload_offset += 4;
 }
 
 void KeplerCompute::FrontPredictLaunch(FrontState& fs, u32 method, u32 argument) {
@@ -1251,6 +1323,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (method == 0x6c || method == 0x6d) {
+        FrontNoteUpload(fs, method, argument);
+    }
     if (method == 0x107 || method == 0xaf || method == 0xb0) {
         FrontPredictLaunch(fs, method, argument);
     }

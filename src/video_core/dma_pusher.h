@@ -214,6 +214,13 @@ public:
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// Split front: notes the guest memory writes an I2M engine method will make on the back.
+    void FrontNoteI2M(u32 method, u32 argument);
+    std::array<u32, 0x70> i2m_regs{};
+    bool i2m_known{};
+    u64 i2m_device{};
+    u32 i2m_size{};
+    u32 i2m_offset{};
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Copies the list's words from memory again, as of suspension count `now`.

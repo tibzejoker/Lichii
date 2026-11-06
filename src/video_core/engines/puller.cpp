@@ -427,8 +427,9 @@ static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& w
     }
     {
         const u64 since = split.ConsumedNow();
-        word = Nx2PredictedAdds::Get().Read(
-            *device, [&] { return dma_pusher.memory_manager.Read<u32>(address); });
+        word = Nx2PredictedAdds::Get().Value(
+            *device, [&] { return dma_pusher.memory_manager.Read<u32>(address); },
+            [&] { return Nx2AsyncReportsSettled(*device, 4); });
         if (split.OverlayQueuedWrites(since, *device, &word, 1)) {
             return true;
         }

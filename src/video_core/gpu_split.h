@@ -10,10 +10,12 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
+#include <fmt/format.h>
 #include "common/common_types.h"
 
 namespace Core {
@@ -181,6 +183,17 @@ public:
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+        // Words that continue the last noted write of this same send join it.
+        if (words != 0 && pending_write_count != 0) {
+            PendingWrite& last = pending_writes[(pending_write_count - 1) % pending_writes.size()];
+            while (words != 0 && last.words != 0 && last.position == write_position &&
+                   last.end == begin && last.words < PendingWriteWords) {
+                last.data[last.words++] = *data++;
+                last.end += sizeof(u32);
+                begin += sizeof(u32);
+                --words;
+            }
+        }
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
             PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];

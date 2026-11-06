@@ -198,7 +198,8 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+        static const bool list_nowait = std::getenv("EDEN_NX2_LIST_NOWAIT") != nullptr; // TEMP upper bound
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() && !list_nowait &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -475,14 +476,15 @@ void DmaPusher::CallMethod(u32 argument) {
                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         // 2D blits and I2M uploads write guest memory at addresses the front doesn't track: macro
         // DMA reads wait for them (Maxwell3D::FrontDmaRead).
-        const bool other_writer = split.Active() &&
-                                  (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                   engine_type == Engines::EngineTypes::Fermi2D);
+        const bool other_writer = split.Active() && engine_type == Engines::EngineTypes::Fermi2D;
+        if (split.Active() && engine_type == Engines::EngineTypes::KeplerMemory) {
+            FrontNoteI2M(dma_state.method, argument);
+        }
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
             } else if (other_writer) {
-                split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
+                split.NoteMemoryWrite(0, ~u64{0}, "2D");
             }
         };
         if (split.Active()) {
@@ -540,14 +542,17 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                             IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         // 2D blits and I2M uploads write guest memory at addresses the front doesn't track: macro
         // DMA reads wait for them (Maxwell3D::FrontDmaRead).
-        const bool other_writer = split.Active() &&
-                                  (engine_type == Engines::EngineTypes::KeplerMemory ||
-                                   engine_type == Engines::EngineTypes::Fermi2D);
+        const bool other_writer = split.Active() && engine_type == Engines::EngineTypes::Fermi2D;
+        if (split.Active() && engine_type == Engines::EngineTypes::KeplerMemory) {
+            for (u32 i = 0; i < num_methods; ++i) {
+                FrontNoteI2M(dma_state.method + (dma_state.non_incrementing ? 0 : i), base_start[i]);
+            }
+        }
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
             } else if (other_writer) {
-                split.NoteMemoryWrite(0, ~u64{0}, "2D or I2M");
+                split.NoteMemoryWrite(0, ~u64{0}, "2D");
             }
         };
         if (split.Active()) {
@@ -609,6 +614,40 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
                                        entry.size * sizeof(u32));
     }
     list.deferred_entries.clear();
+}
+
+void DmaPusher::FrontNoteI2M(u32 method, u32 argument) {
+    // The I2M engine's upload registers (0x60-0x6d, as Upload::State reads them on the back):
+    // linear single-line uploads are noted with their words, others as their range.
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (method < i2m_regs.size()) {
+        i2m_regs[method] = argument;
+    }
+    if (method == 0x6c) {
+        const u64 line_length = i2m_regs[0x60];
+        const u64 lines = i2m_regs[0x61];
+        const GPUVAddr address = (GPUVAddr{i2m_regs[0x62]} << 32) | i2m_regs[0x63];
+        const u64 size = line_length * lines;
+        const auto device = memory_manager.GpuToCpuAddress(address);
+        const bool linear = (argument & 1) != 0;
+        i2m_known = device && linear && lines == 1 && (*device & 3) == 0 && size != 0 &&
+                    memory_manager.GpuToCpuAddress(address + size - 1) == *device + size - 1;
+        i2m_device = device.value_or(0);
+        i2m_size = static_cast<u32>((std::min<u64>)(size, ~0U));
+        i2m_offset = 0;
+        if (!i2m_known && size != 0) {
+            const u64 pitch = (std::max<u64>)(i2m_regs[0x64], line_length);
+            const u64 span = lines == 0 ? size : pitch * (lines - 1) + line_length;
+            if (device && linear && span <= (u64{64} << 20)) {
+                split.NoteMemoryWrite(*device, span, "I2M upload");
+            } else {
+                split.NoteMemoryWrite(0, ~u64{0}, "I2M upload (tiled or unmapped)");
+            }
+        }
+    } else if (method == 0x6d && i2m_known && i2m_offset + 4 <= i2m_size) {
+        split.NoteMemoryWriteData(i2m_device + i2m_offset, &argument, 1);
+        i2m_offset += 4;
+    }
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
