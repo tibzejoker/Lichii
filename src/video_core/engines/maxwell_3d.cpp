@@ -917,6 +917,9 @@ void Maxwell3D::ProcessSyncPoint() {
     const u32 sync_point = regs.sync_info.sync_point.Value();
     [[maybe_unused]] const u32 cache_flush = regs.sync_info.clean_l2.Value();
     rasterizer->SignalSyncPoint(sync_point);
+    if (front_macros && sync_point < Tegra::Nx2SplitSyncpoints) {
+        Tegra::g_nx2_syncpt_applied[sync_point].fetch_add(1, std::memory_order_release);
+    }
 }
 
 void Maxwell3D::ProcessCBBind(size_t stage_index) {
@@ -1206,6 +1209,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (WritesGuestMemory(method)) {
         FrontNoteMemoryWrite(split, fs, method, &value, 1);
     }
+    if (method == MAXWELL3D_REG_INDEX(sync_info) && (value & 0xffff) < Tegra::Nx2SplitSyncpoints) {
+        ++Tegra::g_nx2_syncpt_sent[value & 0xffff];
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1315,6 +1321,13 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
     if (WritesGuestMemory(method) && amount != 0) {
         FrontNoteMemoryWrite(split, fs, method, base_start, amount);
+    }
+    if (method == MAXWELL3D_REG_INDEX(sync_info)) {
+        for (u32 i = 0; i < amount; ++i) {
+            if ((base_start[i] & 0xffff) < Tegra::Nx2SplitSyncpoints) {
+                ++Tegra::g_nx2_syncpt_sent[base_start[i] & 0xffff];
+            }
+        }
     }
 }
 

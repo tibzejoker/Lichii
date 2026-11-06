@@ -204,11 +204,19 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
-    case Puller::FenceOperation::Increment:
-        OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
-            rasterizer->SignalSyncPoint(id);
-        });
+    case Puller::FenceOperation::Increment: {
+        const u32 id = static_cast<u32>(regs.fence_action.syncpoint_id.Value());
+        if (VideoCommon::GpuSplit::Get().Active() && id < Nx2SplitSyncpoints) {
+            ++g_nx2_syncpt_sent[id];
+            VideoCommon::GpuSplit::Get().Defer([rasterizer = dma_pusher.rasterizer, id] {
+                rasterizer->SignalSyncPoint(id);
+                g_nx2_syncpt_applied[id].fetch_add(1, std::memory_order_release);
+            });
+        } else {
+            OnBack([rasterizer = dma_pusher.rasterizer, id] { rasterizer->SignalSyncPoint(id); });
+        }
         break;
+    }
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
         break;
@@ -397,6 +405,16 @@ static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& w
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active() || !Nx2PredictedAdds::Wanted()) {
         return false;
+    }
+    if (const auto id = dma_pusher.memory_manager.ShimSyncpoint(address)) {
+        if (*id >= Nx2SplitSyncpoints) {
+            return false;
+        }
+        // The value first, then what the back applied: never more than the value will be.
+        const u32 value = dma_pusher.memory_manager.Read<u32>(address);
+        const u64 applied = g_nx2_syncpt_applied[*id].load(std::memory_order_acquire);
+        word = value + static_cast<u32>(g_nx2_syncpt_sent[*id] - applied);
+        return true;
     }
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (!device || Nx2IsGpuWritten(*device)) {

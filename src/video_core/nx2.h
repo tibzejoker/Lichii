@@ -214,6 +214,14 @@ inline void Nx2PredictedAdds::Verify(u64 seq) {
     }
 }
 
+// Syncpoint increments sent through the split GPU thread (the puller's fence action, the 3D
+// engine's sync method): how many the front sent and how many the back applied, by id. The back
+// applies them when it runs them (IncrementGuest), so a guest syncpoint value read before the
+// applied count, plus sent - applied, is at most what it will be once the back caught up.
+inline constexpr u32 Nx2SplitSyncpoints = 256;
+inline std::array<u64, Nx2SplitSyncpoints> g_nx2_syncpt_sent{};                 ///< Front only
+inline std::array<std::atomic<u64>, Nx2SplitSyncpoints> g_nx2_syncpt_applied{};
+
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);

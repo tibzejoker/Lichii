@@ -46,6 +46,15 @@ public:
 
     // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
+    /// The syncpoint whose value a 32-bit read of `addr` returns (the native syncpoint shim).
+    [[nodiscard]] std::optional<u32> ShimSyncpoint(GPUVAddr addr) const {
+        const GPUVAddr shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        if (shim == 0 || addr < shim || addr - shim >= NumShimSyncpoints * sizeof(u32) ||
+            ((addr - shim) & 3) != 0) {
+            return std::nullopt;
+        }
+        return static_cast<u32>((addr - shim) / sizeof(u32));
+    }
     static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
 
     /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
