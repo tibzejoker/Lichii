@@ -1212,6 +1212,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (method == MAXWELL3D_REG_INDEX(sync_info) && (value & 0xffff) < Tegra::Nx2SplitSyncpoints) {
         ++Tegra::g_nx2_syncpt_sent[value & 0xffff];
     }
+    if (method == MAXWELL3D_REG_INDEX(wait_for_idle)) {
+        split.NoteSync(); // A host-level wait too (GpuSplit::WaitForWriters)
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

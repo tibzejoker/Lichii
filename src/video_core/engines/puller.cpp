@@ -268,6 +268,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // A host-level wait for GpuSplit::WaitForWriters, also when it passes without a drain.
+        VideoCommon::GpuSplit::Get().NoteSync();
         if (u32 word{}; SemaphoreReadableNow(dma_pusher, acquire.address, word) &&
                         acquire.Matches(word)) {
             return;
