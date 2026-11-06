@@ -43,12 +43,15 @@ public:
         return active.load(std::memory_order_acquire);
     }
     /// EDEN_NX2_RASTER_ASYNC=<bitmask>: which calls are queued (1 draws, 2 queries and fences,
-    /// 4 uniform binds, 8 constant buffer data, 16 inline uploads, 32 the rest); default 15:
-    /// with 16 something still reads inline uploads too early, and 16 or 32 hang Ocarina of Time.
+    /// 4 uniform binds, 8 constant buffer data, 16 inline uploads, 32 all of: 64 cache
+    /// invalidation, 128 wait for idle, 256 fragment barriers, 512 tiled cache barriers, 1024
+    /// command flushes, 2048 frame ticks, 4096 channel binds, 8192 transform feedback, 16384 CPU
+    /// write invalidations). Default 0x7bcf: everything but inline uploads (still read too early)
+    /// and command flushes (one Ocarina of Time run hung with them queued).
     [[nodiscard]] static u32 AsyncGroups() {
         static const u32 groups = [] {
             const char* value = std::getenv("EDEN_NX2_RASTER_ASYNC");
-            return value == nullptr ? 0x0fu : static_cast<u32>(std::strtoul(value, nullptr, 0));
+            return value == nullptr ? 0x7bcfu : static_cast<u32>(std::strtoul(value, nullptr, 0));
         }();
         return groups;
     }

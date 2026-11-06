@@ -82,22 +82,22 @@ public:
         Async(2, [r = &real, force] { r->ReleaseFences(force); }, [&] { real.ReleaseFences(force); });
     }
     void InvalidateGPUCache() override {
-        Async(32, [r = &real] { r->InvalidateGPUCache(); }, [&] { real.InvalidateGPUCache(); });
+        Async(64, [r = &real] { r->InvalidateGPUCache(); }, [&] { real.InvalidateGPUCache(); });
     }
     void WaitForIdle() override {
-        Async(32, [r = &real] { r->WaitForIdle(); }, [&] { real.WaitForIdle(); });
+        Async(128, [r = &real] { r->WaitForIdle(); }, [&] { real.WaitForIdle(); });
     }
     void FragmentBarrier() override {
-        Async(32, [r = &real] { r->FragmentBarrier(); }, [&] { real.FragmentBarrier(); });
+        Async(256, [r = &real] { r->FragmentBarrier(); }, [&] { real.FragmentBarrier(); });
     }
     void TiledCacheBarrier() override {
-        Async(32, [r = &real] { r->TiledCacheBarrier(); }, [&] { real.TiledCacheBarrier(); });
+        Async(512, [r = &real] { r->TiledCacheBarrier(); }, [&] { real.TiledCacheBarrier(); });
     }
     void FlushCommands() override {
-        Async(32, [r = &real] { r->FlushCommands(); }, [&] { real.FlushCommands(); });
+        Async(1024, [r = &real] { r->FlushCommands(); }, [&] { real.FlushCommands(); });
     }
     void TickFrame() override {
-        Async(32, [r = &real] { r->TickFrame(); }, [&] { real.TickFrame(); });
+        Async(2048, [r = &real] { r->TickFrame(); }, [&] { real.TickFrame(); });
     }
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override {
@@ -121,10 +121,10 @@ public:
         real.AccelerateInlineToMemory(address, copy_size, memory);
     }
     void BindChannel(Tegra::Control::ChannelState& channel) override {
-        Async(32, [r = &real, c = &channel] { r->BindChannel(*c); }, [&] { real.BindChannel(channel); });
+        Async(4096, [r = &real, c = &channel] { r->BindChannel(*c); }, [&] { real.BindChannel(channel); });
     }
     void RegisterTransformFeedback(GPUVAddr tfb_object_addr) override {
-        Async(32, [r = &real, tfb_object_addr] { r->RegisterTransformFeedback(tfb_object_addr); },
+        Async(8192, [r = &real, tfb_object_addr] { r->RegisterTransformFeedback(tfb_object_addr); },
               [&] { real.RegisterTransformFeedback(tfb_object_addr); });
     }
 
@@ -164,8 +164,11 @@ public:
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override {
         Sync([&] { real.InnerInvalidation(sequences); });
     }
+    // Queued: the back calls this while it gathers CPU-dirty memory under the dirty manager's
+    // lock, which a raster thread task (SignalSyncPoint -> InvalidateGPUCache) can wait for.
     void OnCacheInvalidation(PAddr addr, u64 size) override {
-        Sync([&] { real.OnCacheInvalidation(addr, size); });
+        Async(16384, [r = &real, addr, size] { r->OnCacheInvalidation(addr, size); },
+              [&] { real.OnCacheInvalidation(addr, size); });
     }
     bool TryCacheInvalidation(DAddr addr, u64 size) override {
         return Sync([&] { return real.TryCacheInvalidation(addr, size); });
@@ -255,7 +258,10 @@ private:
     /// Whether a call without a result is queued: from the producer, outside an owner scope.
     [[nodiscard]] static bool Queued(u32 group) {
         auto& split = VideoCommon::RasterSplit::Get();
-        return (VideoCommon::RasterSplit::AsyncGroups() & group) != 0 && split.OnProducer() &&
+        // 32 queues every call of the groups above it (64 and up: one bit per call).
+        const u32 groups = VideoCommon::RasterSplit::AsyncGroups();
+        const bool wanted = (groups & group) != 0 || (group >= 64 && (groups & 32) != 0);
+        return wanted && split.OnProducer() &&
                VideoCommon::RasterSplit::inline_depth == 0;
     }
     template <typename Queue, typename Direct>
