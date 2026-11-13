@@ -393,3 +393,87 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
 }
+
+TEST_CASE("Built-in Texture Pool x2 doubles the allocator's initial pool size",
+          "[patch_manager]") {
+    constexpr std::string_view TexturePool = "Texture Pool x2 (built-in)";
+    constexpr size_t CallOffset = sizeof(Loader::NSOHeader) + 0xC2A36C;
+    constexpr size_t RoutineOffset = sizeof(Loader::NSOHeader) + 0x3C462C0;
+    constexpr u32 StpInstruction = 0xA90127E8;
+    constexpr u32 CallInstruction = 0x94C06FD5;
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + CallOffset, &StpInstruction, sizeof(StpInstruction));
+
+    auto patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == CallInstruction);
+    REQUIRE(Common::HexToString(std::span{patched}.subspan(RoutineOffset, 12)) ==
+            "08F97FD3E82701A9C0035FD6");
+    REQUIRE(WordAt(patched, RoutineOffset + 12) == 0);
+
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{TexturePool}};
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == StpInstruction);
+    REQUIRE(WordAt(patched, RoutineOffset) == 0);
+
+    Settings::values.disabled_addons.erase(OcarinaTitleId);
+    std::memcpy(nso.data() + CallOffset, &NopInstruction, sizeof(NopInstruction));
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == NopInstruction);
+    REQUIRE(WordAt(patched, RoutineOffset) == 0);
+}
+
+TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_manager]") {
+#ifdef EGLANTINE_STREAMLINE
+    constexpr bool DlssBuild = true;
+#else
+    constexpr bool DlssBuild = false;
+#endif
+    constexpr size_t ScaleOffset = sizeof(Loader::NSOHeader) + 0x806420;
+    constexpr u32 ScaleOne = 0x52A7F009;
+    struct SettingsGuard {
+        ~SettingsGuard() {
+            Settings::values.nvidia_dlss.SetValue(false);
+            Settings::values.nvidia_dlss_quality.SetValue(Settings::NvidiaDlssQuality::Automatic);
+            Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+        }
+    } guard;
+    PatchManagerTestContext context;
+    auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
+    nso.resize(ScaleOffset + sizeof(u32));
+    std::memcpy(nso.data() + ScaleOffset, &ScaleOne, sizeof(ScaleOne));
+    const auto scale = [&] { return WordAt(context.Manager().PatchNSO(nso, "main"), ScaleOffset); };
+
+    Settings::values.nvidia_dlss.SetValue(true);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    using Quality = Settings::NvidiaDlssQuality;
+    for (const auto& [quality, word] : std::array<std::pair<Quality, u32>, 6>{{
+             {Quality::Automatic, ScaleOne},
+             {Quality::Native, ScaleOne},
+             {Quality::Quality, ScaleOne},
+             {Quality::Balanced, 0x52A7EBE9},
+             {Quality::Performance, 0x52A7E809},
+             {Quality::UltraPerformance, 0x52A7E009},
+         }}) {
+        Settings::values.nvidia_dlss_quality.SetValue(quality);
+        CHECK(scale() == (DlssBuild ? word : ScaleOne));
+        CHECK(Settings::AppliedOcarinaRenderScale() ==
+              (DlssBuild && word != ScaleOne ? std::optional{quality} : std::nullopt));
+    }
+
+    Settings::values.nvidia_dlss_quality.SetValue(Quality::Performance);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Handheld);
+    CHECK(scale() == ScaleOne);
+    Settings::values.use_docked_mode.SetValue(Settings::ConsoleMode::Docked);
+    Settings::values.nvidia_dlss.SetValue(false);
+    CHECK(scale() == ScaleOne);
+    Settings::values.nvidia_dlss.SetValue(true);
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
+    CHECK(scale() == ScaleOne);
+    CHECK_FALSE(Settings::AppliedOcarinaRenderScale());
+
+    for (const auto& patch : context.Manager().GetPatches()) {
+        CHECK(patch.name.find("render scale") == std::string::npos);
+    }
+}
